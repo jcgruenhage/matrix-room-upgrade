@@ -1,0 +1,14 @@
+access_token: <token>
+homeserver_url: <hs_url>
+rooms:
+  - '<room_id>'
+pl_overrides:
+  '<user_id>': i00
+target_room_version: "11"
+state_events_to_transfer:
+  - "m.room.power_levels"
+  - "m.room.name"
+  - "m.room.topic"
+  - "m.room.encryption"
+  - "m.room.join_roles"
+  - "m.room.history_visibility"

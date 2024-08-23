@@ -1,0 +1,19 @@
+[package]
+name = "matrix-room-upgrade"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+clap = { version = "4.5.16", features = ["derive"] }
+reqwest = { version = "0.12.7", features = ["json"] }
+serde = { version = "1.0.208", features = ["derive"] }
+serde_json = "1.0.125"
+serde_yaml = "0.9.34"
+tokio = { version = "1.39.3", features = ["rt-multi-thread", "macros"] }
+uuid = { version = "1.10.0", features = ["v4"] }
+
+[build-dependencies]
+anyhow = "1.0.86"
+clap = { version = "4.5.16", features = ["derive"] }
+clap_allgen = "0.2.0"
