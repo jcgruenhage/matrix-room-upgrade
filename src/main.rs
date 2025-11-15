@@ -30,17 +30,21 @@ async fn main() -> anyhow::Result<()> {
         .default_headers(headers)
         .build()?;
 
-    let self_user_id_res = http_client
-        .get(&format!(
-            "{}/_matrix/client/v3/account/whoami",
-            config.homeserver_url
-        ))
-        .send()
-        .await?
-        .json::<Value>()
-        .await?;
 
-    let self_user_id = self_user_id_res["user_id"].as_str().unwrap().to_string();
+    let self_user_id_res = dbg!(
+        dbg!(
+            http_client
+                .get(&format!(
+                    "{}/_matrix/client/v3/account/whoami",
+                    config.homeserver_url
+                ))
+                .send()
+                .await
+        )?
+        .json::<Value>()
+        .await
+    )?;
+    let self_user_id = dbg!(self_user_id_res["user_id"].as_str().unwrap().to_string());
 
     for room in config.rooms {
         if http_client
@@ -144,6 +148,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        dbg!(&banned_members);
+        dbg!(&joined_members);
+
         let txn_id = Uuid::new_v4();
         let res = http_client
             .put(&format!(
@@ -177,26 +184,29 @@ async fn main() -> anyhow::Result<()> {
             .collect());
 
         let target_room_version = format!("{}", config.target_room_version);
-
-        let new_room_res = http_client
-            .post(&format!(
-                "{}/_matrix/client/v3/createRoom",
-                config.homeserver_url
-            ))
-            .json(dbg!(&json!({
-                "creation_content": {
-                    "predecessor": {
-                        "event_id": last_event_id,
-                        "room_id": room,
+        let new_room_res = dbg!(
+            http_client
+                .post(&format!(
+                    "{}/_matrix/client/v3/createRoom",
+                    config.homeserver_url
+                ))
+                .json(dbg!(&json!({
+                    "creation_content": {
+                        "predecessor": {
+                            "event_id": last_event_id,
+                            "room_id": room,
+                        },
                     },
-                },
-                "room_version": target_room_version,
-                "power_level_content_override": power_level_content_override,
-                "initial_state": initial_state,
-            })))
-            .send()
-            .await?;
-        let new_room_body = new_room_res.json::<Value>().await?;
+                    "room_version": target_room_version,
+                    "power_level_content_override": power_level_content_override,
+                    "initial_state": initial_state,
+                })))
+                .send()
+                .await
+        )?;
+
+        let new_room_body = dbg!(new_room_res.json::<Value>().await?);
+
         let new_room_id = new_room_body["room_id"]
             .as_str()
             .context("room id is not a string")?;
