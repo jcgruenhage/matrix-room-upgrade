@@ -93,6 +93,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                     println!("Overrode power level for user {user_id} in room {room} to be {pl}")
                 }
+
+                if config.target_room_version >= 12 {
+                    users.remove(&self_user_id);
+                }
             }
             state.insert(event_type.to_string(), val);
         }
@@ -172,6 +176,8 @@ async fn main() -> anyhow::Result<()> {
             })
             .collect());
 
+        let target_room_version = format!("{}", config.target_room_version);
+
         let new_room_res = http_client
             .post(&format!(
                 "{}/_matrix/client/v3/createRoom",
@@ -184,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
                         "room_id": room,
                     },
                 },
-                "room_version": config.target_room_version,
+                "room_version": target_room_version,
                 "power_level_content_override": power_level_content_override,
                 "initial_state": initial_state,
             })))

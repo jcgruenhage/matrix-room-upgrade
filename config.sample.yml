@@ -4,7 +4,7 @@ rooms:
   - '<room_id>'
 pl_overrides:
   '<user_id>': i00
-target_room_version: "11"
+target_room_version: 12
 state_events_to_transfer:
   - "m.room.avatar"
   - "m.room.encryption"
