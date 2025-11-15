@@ -6,9 +6,10 @@ pl_overrides:
   '<user_id>': i00
 target_room_version: "11"
 state_events_to_transfer:
-  - "m.room.power_levels"
-  - "m.room.name"
-  - "m.room.topic"
+  - "m.room.avatar"
   - "m.room.encryption"
-  - "m.room.join_roles"
   - "m.room.history_visibility"
+  - "m.room.join_rules"
+  - "m.room.name"
+  - "m.room.power_levels"
+  - "m.room.topic"
