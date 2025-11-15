@@ -61,51 +61,6 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
 
-        let mut state: HashMap<String, Value> = HashMap::new();
-        for event_type in &config.state_events_to_transfer {
-            let res = http_client
-                .get(format!(
-                    "{}/_matrix/client/v3/rooms/{room}/state/{event_type}/",
-                    config.homeserver_url
-                ))
-                .send()
-                .await?;
-            if res.status() != StatusCode::OK {
-                continue;
-            }
-            let mut val: Value = res.json().await?;
-            if event_type == "m.room.power_levels" {
-                let map = val.as_object_mut().context("PL state is not an object")?;
-                let users_default = match map.get("users_default") {
-                    Some(num) => num
-                        .as_number()
-                        .context("PL state key users_default is not a number")?
-                        .as_u64()
-                        .context("PL state key users_default is not a u64")?,
-                    None => 0,
-                };
-                let users = map
-                    .get_mut("users")
-                    .context("PL state does not contain users key")?
-                    .as_object_mut()
-                    .context("PL state key users is not an object")?;
-                for (user_id, pl) in config.pl_overrides.iter() {
-                    if users_default == *pl {
-                        users.remove(user_id);
-                    } else {
-                        users.insert(user_id.to_string(), json!(*pl));
-                    }
-                    println!("Overrode power level for user {user_id} in room {room} to be {pl}")
-                }
-
-                if config.target_room_version >= 12 {
-                    users.remove(&self_user_id);
-                }
-            }
-            state.insert(event_type.to_string(), val);
-        }
-        println!("New state for {room}: {state:#?}");
-
         let old_members_res = http_client
             .get(&format!(
                 "{}/_matrix/client/v3/rooms/{room}/members",
@@ -150,6 +105,52 @@ async fn main() -> anyhow::Result<()> {
 
         dbg!(&banned_members);
         dbg!(&joined_members);
+
+        // let new_room_id = if new_room_id.is_none() {
+        let mut state: HashMap<String, Value> = HashMap::new();
+        for event_type in &config.state_events_to_transfer {
+            let res = http_client
+                .get(format!(
+                    "{}/_matrix/client/v3/rooms/{room}/state/{event_type}/",
+                    config.homeserver_url
+                ))
+                .send()
+                .await?;
+            if res.status() != StatusCode::OK {
+                continue;
+            }
+            let mut val: Value = res.json().await?;
+            if event_type == "m.room.power_levels" {
+                let map = val.as_object_mut().context("PL state is not an object")?;
+                let users_default = match map.get("users_default") {
+                    Some(num) => num
+                        .as_number()
+                        .context("PL state key users_default is not a number")?
+                        .as_u64()
+                        .context("PL state key users_default is not a u64")?,
+                    None => 0,
+                };
+                let users = map
+                    .get_mut("users")
+                    .context("PL state does not contain users key")?
+                    .as_object_mut()
+                    .context("PL state key users is not an object")?;
+                for (user_id, pl) in config.pl_overrides.iter() {
+                    if users_default == *pl {
+                        users.remove(user_id);
+                    } else {
+                        users.insert(user_id.to_string(), json!(*pl));
+                    }
+                    println!("Overrode power level for user {user_id} in room {room} to be {pl}")
+                }
+
+                if config.target_room_version >= 12 {
+                    users.remove(&self_user_id);
+                }
+            }
+            state.insert(event_type.to_string(), val);
+        }
+        println!("New state for {room}: {state:#?}");
 
         let txn_id = Uuid::new_v4();
         let res = http_client
