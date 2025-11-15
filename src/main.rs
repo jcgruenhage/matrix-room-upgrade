@@ -179,15 +179,14 @@ async fn main() -> anyhow::Result<()> {
             ))
             .json(dbg!(&json!({
                 "creation_content": {
-                    "room_version": config.target_room_version,
                     "predecessor": {
                         "event_id": last_event_id,
                         "room_id": room,
                     },
                 },
+                "room_version": config.target_room_version,
                 "power_level_content_override": power_level_content_override,
                 "initial_state": initial_state,
-
             })))
             .send()
             .await?;
