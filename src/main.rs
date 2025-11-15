@@ -231,6 +231,9 @@ async fn main() -> anyhow::Result<()> {
         }
 
         for (user_id, reason) in joined_members.iter() {
+            if dbg!(config.drop_members.contains(dbg!(user_id))) {
+                continue;
+            }
             dbg!(
                 dbg!(
                     http_client

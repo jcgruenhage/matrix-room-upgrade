@@ -10,4 +10,5 @@ pub struct Config {
     pub rooms: Vec<String>,
     pub pl_overrides: HashMap<String, u64>,
     pub state_events_to_transfer: Vec<String>,
+    pub drop_members: Vec<String>,
 }
