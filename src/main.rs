@@ -94,6 +94,7 @@ async fn create_replacement_room(
         &config.homeserver_url,
         room,
         "m.room.power_levels",
+        "",
     )
     .await?
     .context("room has no power levels")?;
@@ -128,7 +129,7 @@ async fn create_replacement_room(
             continue;
         }
         if let Some(content) =
-            get_state(http_client, &config.homeserver_url, room, event_type).await?
+            get_state(http_client, &config.homeserver_url, room, event_type, "").await?
         {
             initial_state.push(json!({
                 "content": content,
@@ -201,6 +202,7 @@ async fn upgrade_room(
         &config.homeserver_url,
         room,
         "m.room.tombstone",
+        "",
     )
     .await?;
     let new_room_id = if let Some(tombstone_content) = tombstone {
@@ -271,6 +273,7 @@ async fn upgrade_room(
             &config.homeserver_url,
             room,
             "m.room.tombstone",
+            "",
             &json!({
                 "body": "This room has been replaced",
                 "replacement_room": new_room_id,
@@ -375,7 +378,7 @@ async fn restrict_old_room(
     homeserver_url: &str,
     room: &str,
 ) -> anyhow::Result<()> {
-    let mut power_levels = get_state(http_client, homeserver_url, room, "m.room.power_levels")
+    let mut power_levels = get_state(http_client, homeserver_url, room, "m.room.power_levels", "")
         .await?
         .context("room has no power levels")?;
     let map = power_levels
@@ -395,6 +398,7 @@ async fn restrict_old_room(
             homeserver_url,
             room,
             "m.room.power_levels",
+            "",
             &power_levels,
         )
         .await?;
@@ -402,13 +406,14 @@ async fn restrict_old_room(
     }
 
     // A room without join rules is invite only already.
-    let join_rules = get_state(http_client, homeserver_url, room, "m.room.join_rules").await?;
+    let join_rules = get_state(http_client, homeserver_url, room, "m.room.join_rules", "").await?;
     if join_rules.is_some_and(|content| content["join_rule"] != "invite") {
         put_state(
             http_client,
             homeserver_url,
             room,
             "m.room.join_rules",
+            "",
             &json!({ "join_rule": "invite" }),
         )
         .await?;
@@ -435,9 +440,15 @@ async fn move_aliases(
         .split_once(':')
         .context("user ID has no server name")?
         .1;
-    let canonical_alias = get_state(http_client, homeserver_url, room, "m.room.canonical_alias")
-        .await?
-        .filter(|content| content.as_object().is_some_and(|map| !map.is_empty()));
+    let canonical_alias = get_state(
+        http_client,
+        homeserver_url,
+        room,
+        "m.room.canonical_alias",
+        "",
+    )
+    .await?
+    .filter(|content| content.as_object().is_some_and(|map| !map.is_empty()));
 
     let local_aliases = send(http_client.get(format!(
         "{homeserver_url}/_matrix/client/v3/rooms/{room}/aliases"
@@ -509,6 +520,7 @@ async fn move_aliases(
             homeserver_url,
             new_room_id,
             "m.room.canonical_alias",
+            "",
             &canonical_alias,
         )
         .await?;
@@ -517,6 +529,7 @@ async fn move_aliases(
             homeserver_url,
             room,
             "m.room.canonical_alias",
+            "",
             &json!({}),
         )
         .await?;
@@ -597,18 +610,19 @@ fn power_level(power_levels: &serde_json::Map<String, Value>, key: &str) -> anyh
     }
 }
 
-/// Sends a state event with an empty state key.
+/// Sends a state event.
 async fn put_state(
     http_client: &reqwest::Client,
     homeserver_url: &str,
     room: &str,
     event_type: &str,
+    state_key: &str,
     content: &Value,
 ) -> anyhow::Result<()> {
     send(
         http_client
             .put(format!(
-                "{homeserver_url}/_matrix/client/v3/rooms/{room}/state/{event_type}/"
+                "{homeserver_url}/_matrix/client/v3/rooms/{room}/state/{event_type}/{state_key}"
             ))
             .json(content),
     )
@@ -616,16 +630,16 @@ async fn put_state(
     Ok(())
 }
 
-/// Fetches the content of a state event with an empty state key, or `None` if the room has no
-/// such state event.
+/// Fetches the content of a state event, or `None` if the room has no such state event.
 async fn get_state(
     http_client: &reqwest::Client,
     homeserver_url: &str,
     room: &str,
     event_type: &str,
+    state_key: &str,
 ) -> anyhow::Result<Option<Value>> {
     let res = send_retrying(http_client.get(format!(
-        "{homeserver_url}/_matrix/client/v3/rooms/{room}/state/{event_type}/"
+        "{homeserver_url}/_matrix/client/v3/rooms/{room}/state/{event_type}/{state_key}"
     )))
     .await?;
     if res.status() == StatusCode::NOT_FOUND {
