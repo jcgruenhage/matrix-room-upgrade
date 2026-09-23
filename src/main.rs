@@ -45,21 +45,18 @@ async fn main() -> anyhow::Result<()> {
         .default_headers(headers)
         .build()?;
 
-    let self_user_id_res = dbg!(
-        dbg!(
-            send(http_client.get(format!(
-                "{}/_matrix/client/v3/account/whoami",
-                config.homeserver_url
-            )))
-            .await
-        )?
-        .json::<Value>()
-        .await
-    )?;
-    let self_user_id = dbg!(self_user_id_res["user_id"]
+    let self_user_id_res = send(http_client.get(format!(
+        "{}/_matrix/client/v3/account/whoami",
+        config.homeserver_url
+    )))
+    .await?
+    .json::<Value>()
+    .await?;
+    let self_user_id = self_user_id_res["user_id"]
         .as_str()
         .context("whoami response has no user_id")?
-        .to_string());
+        .to_string();
+    debug!("Logged in as {self_user_id}");
 
     let mut failed_rooms = Vec::new();
     for room in &config.rooms {
@@ -116,7 +113,6 @@ async fn upgrade_room(
         .context("members response should have array called chunk but doesn't")?
         .iter()
     {
-        dbg!(member);
         let membership = member["content"]["membership"]
             .as_str()
             .context("member event has no membership")?;
@@ -134,8 +130,7 @@ async fn upgrade_room(
         }
     }
 
-    dbg!(&banned_members);
-    dbg!(&joined_members);
+    debug!("Members in the old room: {joined_members:?}, banned: {banned_members:?}");
 
     let new_room_id = if let Some(new_room_id) = new_room_id {
         new_room_id
@@ -209,7 +204,7 @@ async fn upgrade_room(
                 )),
         )
         .await?;
-        let last_event_id = dbg!(dbg!(res).json::<Value>().await?)["event_id"]
+        let last_event_id = res.json::<Value>().await?["event_id"]
             .as_str()
             .context("event_id is not a string")?
             .to_string();
@@ -218,28 +213,27 @@ async fn upgrade_room(
 
         let target_room_version = format!("{}", config.target_room_version);
 
-        let new_room_res = dbg!(
-            send(
-                http_client
-                    .post(format!(
-                        "{}/_matrix/client/v3/createRoom",
-                        config.homeserver_url
-                    ))
-                    .json(dbg!(&json!({
-                        "creation_content": {
-                            "predecessor": {
-                                "event_id": last_event_id,
-                                "room_id": room,
-                            },
+        let new_room_body = send(
+            http_client
+                .post(format!(
+                    "{}/_matrix/client/v3/createRoom",
+                    config.homeserver_url
+                ))
+                .json(&json!({
+                    "creation_content": {
+                        "predecessor": {
+                            "event_id": last_event_id,
+                            "room_id": room,
                         },
-                        "room_version": target_room_version,
-                        "power_level_content_override": power_levels,
-                        "initial_state": initial_state,
-                    })))
-            )
-            .await
-        )?;
-        let new_room_body = dbg!(new_room_res.json::<Value>().await?);
+                    },
+                    "room_version": target_room_version,
+                    "power_level_content_override": power_levels,
+                    "initial_state": initial_state,
+                })),
+        )
+        .await?
+        .json::<Value>()
+        .await?;
         let new_room_id = new_room_body["room_id"]
             .as_str()
             .context("room id is not a string")?;
@@ -275,7 +269,7 @@ async fn upgrade_room(
         .iter()
         .filter_map(|member| member["state_key"].as_str())
         .collect();
-    dbg!(&new_members);
+    debug!("Members in the new room: {new_members:?}");
 
     let mut failures = 0;
     for (user_id, reason) in banned_members.iter() {
@@ -303,7 +297,7 @@ async fn upgrade_room(
     }
 
     for (user_id, reason) in joined_members.iter() {
-        if dbg!(config.drop_members.contains(dbg!(user_id)))
+        if config.drop_members.contains(user_id)
             || self_user_id == user_id
             || new_members.contains(user_id.as_str())
         {
