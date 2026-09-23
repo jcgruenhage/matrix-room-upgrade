@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::time::Duration;
 
@@ -130,45 +130,60 @@ async fn upgrade_room(
     dbg!(&joined_members);
 
     let new_room_id = if new_room_id.is_none() {
-        let mut state: HashMap<String, Value> = HashMap::new();
-        for event_type in &config.state_events_to_transfer {
-            let Some(mut val) =
-                get_state(http_client, &config.homeserver_url, room, event_type).await?
-            else {
-                continue;
-            };
-            if event_type == "m.room.power_levels" {
-                let map = val.as_object_mut().context("PL state is not an object")?;
-                let users_default = match map.get("users_default") {
-                    Some(num) => num
-                        .as_number()
-                        .context("PL state key users_default is not a number")?
-                        .as_u64()
-                        .context("PL state key users_default is not a u64")?,
-                    None => 0,
-                };
-                let users = map
-                    .get_mut("users")
-                    .context("PL state does not contain users key")?
-                    .as_object_mut()
-                    .context("PL state key users is not an object")?;
+        let mut power_levels = get_state(
+            http_client,
+            &config.homeserver_url,
+            room,
+            "m.room.power_levels",
+        )
+        .await?
+        .context("room has no power levels")?;
+        let map = power_levels
+            .as_object_mut()
+            .context("PL state is not an object")?;
+        let users_default = match map.get("users_default") {
+            Some(num) => num
+                .as_number()
+                .context("PL state key users_default is not a number")?
+                .as_u64()
+                .context("PL state key users_default is not a u64")?,
+            None => 0,
+        };
+        let users = map
+            .get_mut("users")
+            .context("PL state does not contain users key")?
+            .as_object_mut()
+            .context("PL state key users is not an object")?;
 
-                for (user_id, pl) in config.pl_overrides.iter() {
-                    if users_default == *pl {
-                        users.remove(user_id);
-                    } else {
-                        users.insert(user_id.to_string(), json!(*pl));
-                    }
-                    println!("Overrode power level for user {user_id} in room {room} to be {pl}")
-                }
-
-                if config.target_room_version >= 12 {
-                    users.remove(self_user_id);
-                }
+        for (user_id, pl) in config.pl_overrides.iter() {
+            if users_default == *pl {
+                users.remove(user_id);
+            } else {
+                users.insert(user_id.to_string(), json!(*pl));
             }
-            state.insert(event_type.to_string(), val);
+            println!("Overrode power level for user {user_id} in room {room} to be {pl}")
         }
-        println!("New state for {room}: {state:#?}");
+
+        if config.target_room_version >= 12 {
+            users.remove(self_user_id);
+        }
+
+        let mut initial_state = Vec::new();
+        for event_type in &config.state_events_to_transfer {
+            // Power levels are passed separately as power_level_content_override.
+            if event_type == "m.room.power_levels" {
+                continue;
+            }
+            if let Some(content) =
+                get_state(http_client, &config.homeserver_url, room, event_type).await?
+            {
+                initial_state.push(json!({
+                    "content": content,
+                    "type": event_type,
+                }));
+            }
+        }
+        println!("New state for {room}: {initial_state:#?}, power levels: {power_levels:#?}");
 
         let txn_id = Uuid::new_v4();
         let res = send(
@@ -191,18 +206,6 @@ async fn upgrade_room(
 
         println!("Last event ID: {last_event_id}");
 
-        let power_level_content_override = dbg!(state.remove("m.room.power_levels").unwrap());
-        let initial_state: Vec<_> = dbg!(state
-            .into_iter()
-            .filter(|(event_type, _)| event_type != "m.room.power_levels")
-            .map(|(event_type, content)| {
-                json!({
-                    "content": content,
-                    "type": event_type,
-                })
-            })
-            .collect());
-
         let target_room_version = format!("{}", config.target_room_version);
 
         let new_room_res = dbg!(
@@ -220,7 +223,7 @@ async fn upgrade_room(
                             },
                         },
                         "room_version": target_room_version,
-                        "power_level_content_override": power_level_content_override,
+                        "power_level_content_override": power_levels,
                         "initial_state": initial_state,
                     })))
             )
