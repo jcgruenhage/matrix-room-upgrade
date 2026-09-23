@@ -125,8 +125,8 @@ async fn create_replacement_room(
     normalize_power_levels(map)?;
     let users_default = power_level(map, "users_default", int!(0))?;
     let users = map
-        .get_mut("users")
-        .context("PL state does not contain users key")?
+        .entry("users")
+        .or_insert_with(|| json!({}))
         .as_object_mut()
         .context("PL state key users is not an object")?;
 
