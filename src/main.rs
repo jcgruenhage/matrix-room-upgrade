@@ -8,8 +8,7 @@ use reqwest::{header, StatusCode};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-const APP_USER_AGENT: &'static str =
-    concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
+const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -35,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
 
     let self_user_id_res = dbg!(
         dbg!(
-            send(http_client.get(&format!(
+            send(http_client.get(format!(
                 "{}/_matrix/client/v3/account/whoami",
                 config.homeserver_url
             )))
@@ -67,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
-        let old_members_res = send(http_client.get(&format!(
+        let old_members_res = send(http_client.get(format!(
             "{}/_matrix/client/v3/rooms/{room}/members",
             config.homeserver_url
         )))
@@ -160,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
             let txn_id = Uuid::new_v4();
             let res = send(
                 http_client
-                    .put(&format!(
+                    .put(format!(
                         "{}/_matrix/client/v3/rooms/{room}/send/m.room.message/{txn_id}",
                         config.homeserver_url
                     ))
@@ -195,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
             let new_room_res = dbg!(
                 send(
                     http_client
-                        .post(&format!(
+                        .post(format!(
                             "{}/_matrix/client/v3/createRoom",
                             config.homeserver_url
                         ))
@@ -220,7 +219,7 @@ async fn main() -> anyhow::Result<()> {
 
             send(
                 http_client
-                    .put(&format!(
+                    .put(format!(
                         "{}/_matrix/client/v3/rooms/{room}/state/m.room.tombstone/",
                         config.homeserver_url
                     ))
@@ -238,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
                 .context("we're in the else clause of a if is_none, it should be here really")?
         };
 
-        let new_members_res = send(http_client.get(&format!(
+        let new_members_res = send(http_client.get(format!(
             "{}/_matrix/client/v3/rooms/{new_room_id}/members",
             config.homeserver_url
         )))
@@ -261,7 +260,7 @@ async fn main() -> anyhow::Result<()> {
                 dbg!(
                     send(
                         http_client
-                            .post(&format!(
+                            .post(format!(
                                 "{}/_matrix/client/v3/rooms/{new_room_id}/ban",
                                 config.homeserver_url
                             ))
@@ -289,7 +288,7 @@ async fn main() -> anyhow::Result<()> {
                 dbg!(
                     send(
                         http_client
-                            .post(&format!(
+                            .post(format!(
                                 "{}/_matrix/client/v3/rooms/{new_room_id}/invite",
                                 config.homeserver_url
                             ))
