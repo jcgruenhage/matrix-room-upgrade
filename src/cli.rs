@@ -16,4 +16,8 @@ pub struct Cli {
     /// Log less, can be repeated
     #[arg(short, long, action = ArgAction::Count, conflicts_with = "verbose")]
     pub quiet: u8,
+
+    /// Only log what would be done, without asking anything or changing any room
+    #[arg(long)]
+    pub dry_run: bool,
 }

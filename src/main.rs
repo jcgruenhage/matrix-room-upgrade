@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -19,6 +20,13 @@ const ADMIN_API: &str = "_synapse/admin/v1";
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
+/// Whether to only log what would be done, as set on the command line.
+static DRY_RUN: AtomicBool = AtomicBool::new(false);
+
+fn dry_run() -> bool {
+    DRY_RUN.load(Ordering::Relaxed)
+}
+
 mod cli;
 mod config;
 mod state;
@@ -26,6 +34,7 @@ mod state;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
+    DRY_RUN.store(cli.dry_run, Ordering::Relaxed);
     // LevelFilter::iter() runs from Off to Trace, so index 3 is the default of Info.
     let log_level = LevelFilter::iter()
         .nth((3 + usize::from(cli.verbose)).saturating_sub(usize::from(cli.quiet)))
@@ -77,8 +86,9 @@ async fn main() -> anyhow::Result<()> {
     let mut failures = Failures::default();
     let mut prepared_rooms = Vec::new();
     for room in &config.rooms {
-        match prepare_room(&http_client, &config.homeserver_url, &self_user_id, room).await {
-            Ok(steps) => prepared_rooms.push((room, steps)),
+        match prepare_room(&http_client, &config, &self_user_id, room).await {
+            Ok(Some(steps)) => prepared_rooms.push((room, steps)),
+            Ok(None) => {}
             Err(err) => {
                 error!("Failed to prepare {room}: {err:#}");
                 failures.add("preparing rooms");
@@ -86,23 +96,25 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let fixes = plan_fixes(&http_client, &config, &self_user_id, &mut failures).await?;
-    for (room, steps) in prepared_rooms {
-        if let Err(err) = upgrade_room(
-            &http_client,
-            &config,
-            &mut state,
-            &self_user_id,
-            room,
-            steps,
-            &mut failures,
-        )
-        .await
-        {
-            error!("Failed to upgrade {room}: {err:#}");
-            failures.add("upgrading rooms");
+    if !dry_run() {
+        for (room, steps) in prepared_rooms {
+            if let Err(err) = upgrade_room(
+                &http_client,
+                &config,
+                &mut state,
+                &self_user_id,
+                room,
+                steps,
+                &mut failures,
+            )
+            .await
+            {
+                error!("Failed to upgrade {room}: {err:#}");
+                failures.add("upgrading rooms");
+            }
         }
+        apply_fixes(&http_client, &config, &self_user_id, fixes, &mut failures).await?;
     }
-    apply_fixes(&http_client, &config, &self_user_id, fixes, &mut failures).await?;
     anyhow::ensure!(
         failures.0.is_empty(),
         "some steps failed, see the warnings above and re-run to retry them: {failures}"
@@ -320,16 +332,22 @@ struct Steps {
 ///
 /// If we don't, this offers to take over the power of the local user with the most power
 /// through Synapse's make_room_admin admin API, and to skip the steps we still can't do.
+///
+/// In a dry run, this returns `None` for rooms it can't look into without joining them.
 async fn prepare_room(
     http_client: &reqwest::Client,
-    homeserver_url: &str,
+    config: &config::Config,
     self_user_id: &str,
     room: &str,
-) -> anyhow::Result<Steps> {
+) -> anyhow::Result<Option<Steps>> {
+    let homeserver_url = &config.homeserver_url;
     let (admin_api, room_state) = match admin_room_state(http_client, homeserver_url, room).await? {
         Some(room_state) => (true, room_state),
         None => {
-            join(http_client, homeserver_url, room).await?;
+            if !join(http_client, homeserver_url, room).await? {
+                warn!("Can't check {room} without joining it or using the admin API");
+                return Ok(None);
+            }
             (false, room_state(http_client, homeserver_url, room).await?)
         }
     };
@@ -406,7 +424,76 @@ async fn prepare_room(
         move_aliases: do_step("move its aliases", move_aliases)?,
     };
     join(http_client, homeserver_url, room).await?;
-    Ok(steps)
+    if dry_run() {
+        info!(
+            "{}",
+            describe_upgrade(
+                config,
+                self_user_id,
+                room,
+                &power,
+                steps.lock_down && lock_down > int!(0),
+                steps.move_aliases && has_aliases,
+            )
+        );
+    }
+    Ok(Some(steps))
+}
+
+/// Describes what upgrading `room` would do, for dry runs.
+fn describe_upgrade(
+    config: &config::Config,
+    self_user_id: &str,
+    room: &str,
+    power: &Power<'_>,
+    lock_down: bool,
+    move_aliases: bool,
+) -> String {
+    let mut steps = Vec::new();
+    match power
+        .find("m.room.tombstone", "")
+        .and_then(|tombstone| tombstone["content"]["replacement_room"].as_str())
+    {
+        Some(replacement) => steps.push(format!("finish upgrading it to {replacement}")),
+        None => {
+            let transferred: Vec<&str> = config
+                .state_events_to_transfer
+                .iter()
+                .filter(|event_type| power.find(event_type, "").is_some())
+                .map(String::as_str)
+                .collect();
+            steps.push(format!(
+                "create a room of version {} with its {}",
+                config.target_room_version,
+                transferred.join(", ")
+            ));
+        }
+    }
+    if lock_down {
+        steps.push("lock it down".to_string());
+    }
+    if move_aliases {
+        steps.push("move its aliases".to_string());
+    }
+    let (mut invites, mut bans) = (0, 0);
+    for event in power.room_state {
+        let Some(user_id) = event["state_key"].as_str() else {
+            continue;
+        };
+        if event["type"] != "m.room.member"
+            || user_id == self_user_id
+            || config.drop_members.iter().any(|dropped| dropped == user_id)
+        {
+            continue;
+        }
+        match event["content"]["membership"].as_str() {
+            Some("join" | "invite") => invites += 1,
+            Some("ban") => bans += 1,
+            _ => {}
+        }
+    }
+    steps.push(format!("invite {invites} and ban {bans} members"));
+    format!("Would upgrade {room}: {}", steps.join(", "))
 }
 
 /// Fetches the state of `room` through the admin API, which also works for rooms we aren't in, or
@@ -634,6 +721,10 @@ async fn offer_make_room_admin(
     ))? {
         return Ok(level);
     }
+    if dry_run() {
+        info!("Would get power level {granted} in {room} through {admin_user}");
+        return Ok(granted);
+    }
     send(
         http_client
             .post(url(
@@ -648,17 +739,22 @@ async fn offer_make_room_admin(
     Ok(granted)
 }
 
-/// Joins `room` unless we're in it already.
+/// Joins `room` unless we're in it already, returning whether we are in it now, which in a dry
+/// run we are only if we were already.
 async fn join(
     http_client: &reqwest::Client,
     homeserver_url: &str,
     room: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     if !joined_rooms(http_client, homeserver_url)
         .await?
         .iter()
         .any(|joined_room| joined_room == room)
     {
+        if dry_run() {
+            info!("Would join {room}");
+            return Ok(false);
+        }
         send(
             http_client
                 .post(url(homeserver_url, CLIENT_API, &["rooms", room, "join"])?)
@@ -667,7 +763,7 @@ async fn join(
         .await?;
         info!("Joined {room}");
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Lists the rooms we're in.
@@ -688,8 +784,13 @@ async fn joined_rooms(
         .collect())
 }
 
-/// Asks the user a yes/no question, defaulting to no.
+/// Asks the user a yes/no question, defaulting to no. In a dry run, this only logs the question
+/// and answers yes, to show what would be done then.
 fn confirm(prompt: String) -> anyhow::Result<bool> {
+    if dry_run() {
+        info!("Would ask: {prompt}");
+        return Ok(true);
+    }
     Ok(dialoguer::Confirm::new()
         .with_prompt(prompt)
         .default(false)
@@ -1318,6 +1419,8 @@ async fn plan_fixes(
             }
             if level < needed {
                 warn!("Not locking down {room}, as we have power level {level} but need {needed}");
+            } else if dry_run() {
+                info!("Would lock down {room}");
             } else if let Err(err) = restrict_old_room(http_client, homeserver_url, room).await {
                 warn!("Failed to lock down {room}: {err:#}");
                 failures.add("locking down rooms");
@@ -1348,6 +1451,9 @@ async fn plan_fixes(
             if level < needed {
                 warn!("Skipped: {description}, as we have power level {level} but need {needed}");
                 continue;
+            }
+            if dry_run() {
+                info!("Would do: {description}");
             }
             approved
                 .entry(room.clone())
