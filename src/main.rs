@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::time::Duration;
 
@@ -99,9 +99,14 @@ async fn main() -> anyhow::Result<()> {
             failed_rooms.push(room);
         }
     }
+    let failures = fix_outdated_references(&http_client, &config, &self_user_id).await?;
     anyhow::ensure!(
         failed_rooms.is_empty(),
         "failed to upgrade {failed_rooms:?}"
+    );
+    anyhow::ensure!(
+        failures == 0,
+        "{failures} references to upgraded rooms couldn't be updated, re-run to retry them"
     );
     Ok(())
 }
@@ -402,6 +407,26 @@ async fn admin_room_state(
     }
     let mut body = error_for_status(res).await?.json::<Value>().await?;
     Ok(Some(serde_json::from_value(body["state"].take())?))
+}
+
+/// Whether we can use the admin API. Only server admins can use it, and reverse proxies often
+/// don't expose it.
+async fn admin_api_available(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    self_user_id: &str,
+) -> anyhow::Result<bool> {
+    let res = send_retrying(http_client.get(url(
+        homeserver_url,
+        ADMIN_API,
+        &["users", self_user_id, "admin"],
+    )?))
+    .await?;
+    if matches!(res.status(), StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) {
+        return Ok(false);
+    }
+    error_for_status(res).await?;
+    Ok(true)
 }
 
 /// Fetches the state of `room`, which we need to be in.
@@ -772,7 +797,6 @@ async fn upgrade_room(
         warn!("Failed to move the aliases of {room}: {err:#}");
         failures += 1;
     }
-    failures += move_references(http_client, &config.homeserver_url, room, &new_room_id).await?;
 
     let new_members_res = send(http_client.get(url(
         &config.homeserver_url,
@@ -1043,166 +1067,215 @@ async fn move_aliases(
     Ok(())
 }
 
-/// Updates the rooms we're in that refer to `room` to refer to `new_room_id`. Returns how many
-/// updates failed, e.g. because we lack the power level to make them.
-async fn move_references(
-    http_client: &reqwest::Client,
-    homeserver_url: &str,
+/// Replacement room IDs by the ID of the room they replace, for the rooms in `room_states`.
+fn replacements(room_states: &[(String, Vec<Value>)]) -> HashMap<&str, &str> {
+    room_states
+        .iter()
+        .filter_map(|(room, room_state)| {
+            let tombstone = room_state
+                .iter()
+                .find(|event| event["type"] == "m.room.tombstone" && event["state_key"] == "")?;
+            Some((
+                room.as_str(),
+                tombstone["content"]["replacement_room"].as_str()?,
+            ))
+        })
+        .collect()
+}
+
+/// Follows the upgrades of `room` in `replacements`, returning the rooms that replaced it in
+/// order, which ends with the one that is current.
+fn replacement_chain<'a>(replacements: &HashMap<&'a str, &'a str>, room: &'a str) -> Vec<&'a str> {
+    let mut chain = Vec::new();
+    let mut room = room;
+    while let Some(&replacement) = replacements.get(room) {
+        // Rooms can't be upgraded to rooms they were upgraded from, but tombstones can say so.
+        if replacement == room || chain.contains(&replacement) {
+            break;
+        }
+        chain.push(replacement);
+        room = replacement;
+    }
+    chain
+}
+
+/// A change to a room's state that makes it refer to the current replacement of an upgraded room
+/// instead of the upgraded room.
+struct Change {
+    /// What the change does, phrased as an instruction.
+    description: String,
+    /// The state events to send, as their type, state key and content.
+    events: Vec<(&'static str, String, Value)>,
+}
+
+/// Lists the changes that make `room_state` refer to the current replacements of upgraded rooms.
+fn outdated_references(
     room: &str,
-    new_room_id: &str,
+    room_state: &[Value],
+    replacements: &HashMap<&str, &str>,
+) -> Vec<Change> {
+    let latest = |room: &str| {
+        replacements
+            .get_key_value(room)
+            .and_then(|(room, _)| replacement_chain(replacements, room).last().copied())
+    };
+    let mut changes = Vec::new();
+
+    let join_rules = room_state
+        .iter()
+        .find(|event| event["type"] == "m.room.join_rules" && event["state_key"] == "")
+        .map(|event| &event["content"]);
+    if let Some((join_rules, allow)) =
+        join_rules.and_then(|content| Some((content, content["allow"].as_array()?)))
+    {
+        let mut replaced = Vec::new();
+        let mut new_allow: Vec<Value> = Vec::new();
+        for condition in allow {
+            let mut condition = condition.clone();
+            if condition["type"] == "m.room_membership" {
+                if let Some((old, new)) = condition["room_id"]
+                    .as_str()
+                    .and_then(|old| Some((old.to_string(), latest(old)?)))
+                {
+                    replaced.push(format!("{old} with {new}"));
+                    condition["room_id"] = json!(new);
+                }
+            }
+            if !new_allow.contains(&condition) {
+                new_allow.push(condition);
+            }
+        }
+        if !replaced.is_empty() {
+            let mut content = join_rules.clone();
+            content["allow"] = json!(new_allow);
+            changes.push(Change {
+                description: format!(
+                    "Replace {} in the join rules of {room}",
+                    replaced.join(", ")
+                ),
+                events: vec![("m.room.join_rules", String::new(), content)],
+            });
+        }
+    }
+
+    for event in room_state {
+        let event_type = match event["type"].as_str() {
+            Some("m.space.parent") => "m.space.parent",
+            Some("m.space.child") => "m.space.child",
+            _ => continue,
+        };
+        let (Some(old), true) = (event["state_key"].as_str(), has_via(&event["content"])) else {
+            continue;
+        };
+        let Some(new) = latest(old) else {
+            continue;
+        };
+        let mut events = Vec::new();
+        if !room_state.iter().any(|event| {
+            event["type"] == event_type && event["state_key"] == new && has_via(&event["content"])
+        }) {
+            events.push((event_type, new.to_string(), event["content"].clone()));
+        }
+        events.push((event_type, old.to_string(), json!({})));
+        let description = if event_type == "m.space.parent" {
+            format!("Replace {old} with {new} as a parent space of {room}")
+        } else {
+            format!("Replace {old} with {new} as a child of {room}")
+        };
+        changes.push(Change {
+            description,
+            events,
+        });
+    }
+    changes
+}
+
+/// Makes the rooms we're in refer to the current replacements of upgraded rooms, in their join
+/// rules and space hierarchy. Rooms in the config and their replacements are changed right away,
+/// any other room only if the user confirms. Returns how many changes failed.
+async fn fix_outdated_references(
+    http_client: &reqwest::Client,
+    config: &config::Config,
+    self_user_id: &str,
 ) -> anyhow::Result<usize> {
+    let homeserver_url = &config.homeserver_url;
     let mut failures = 0;
-    for other_room in joined_rooms(http_client, homeserver_url).await? {
-        if let Err(err) =
-            move_join_rule_reference(http_client, homeserver_url, room, new_room_id, &other_room)
-                .await
-        {
-            warn!("Failed to allow members of {new_room_id} to join {other_room}: {err:#}");
-            failures += 1;
+    let mut room_states = Vec::new();
+    for room in joined_rooms(http_client, homeserver_url).await? {
+        match room_state(http_client, homeserver_url, &room).await {
+            Ok(room_state) => room_states.push((room, room_state)),
+            Err(err) => {
+                warn!("Failed to get the state of {room}: {err:#}");
+                failures += 1;
+            }
         }
-        if let Err(err) =
-            move_space_parent_reference(http_client, homeserver_url, room, new_room_id, &other_room)
-                .await
-        {
-            warn!("Failed to make {new_room_id} a parent of {other_room}: {err:#}");
-            failures += 1;
+    }
+    let replacements = replacements(&room_states);
+    let configured: HashSet<&str> = config
+        .rooms
+        .iter()
+        .flat_map(|room| {
+            std::iter::once(room.as_str()).chain(replacement_chain(&replacements, room))
+        })
+        .collect();
+
+    let admin_api = admin_api_available(http_client, homeserver_url, self_user_id).await?;
+    for (room, room_state) in &room_states {
+        if replacements.contains_key(room.as_str()) {
+            continue;
         }
-        if let Err(err) =
-            move_space_child_reference(http_client, homeserver_url, room, new_room_id, &other_room)
-                .await
-        {
-            warn!("Failed to replace {room} with {new_room_id} in {other_room}: {err:#}");
-            failures += 1;
+        let power = Power::new(room_state)?;
+        let mut level = power.user(self_user_id)?;
+        for change in outdated_references(room, room_state, &replacements) {
+            let description = &change.description;
+            if !configured.contains(room.as_str()) && !confirm(format!("{description}?"))? {
+                continue;
+            }
+            let mut needed = int!(0);
+            for (event_type, _, _) in &change.events {
+                needed = needed.max(power.state_event(event_type)?);
+            }
+            if admin_api && level < needed {
+                level = offer_make_room_admin(
+                    http_client,
+                    homeserver_url,
+                    self_user_id,
+                    room,
+                    &power,
+                    level,
+                    &needed.to_string(),
+                )
+                .await?;
+            }
+            if level < needed {
+                warn!("Skipped: {description}, as we have power level {level} but need {needed}");
+                continue;
+            }
+            let result = async {
+                for (event_type, state_key, content) in &change.events {
+                    put_state(
+                        http_client,
+                        homeserver_url,
+                        room,
+                        event_type,
+                        state_key,
+                        content,
+                    )
+                    .await?;
+                }
+                anyhow::Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => info!("Done: {description}"),
+                Err(err) => {
+                    warn!("Failed: {description}: {err:#}");
+                    failures += 1;
+                }
+            }
         }
     }
     Ok(failures)
-}
-
-/// Lets members of `new_room_id` join `other_room` if its join rules let members of `room` join.
-/// Members of `room` stay allowed, as not all of them will have moved yet.
-async fn move_join_rule_reference(
-    http_client: &reqwest::Client,
-    homeserver_url: &str,
-    room: &str,
-    new_room_id: &str,
-    other_room: &str,
-) -> anyhow::Result<()> {
-    let Some(mut join_rules) = get_state(
-        http_client,
-        homeserver_url,
-        other_room,
-        "m.room.join_rules",
-        "",
-    )
-    .await?
-    else {
-        return Ok(());
-    };
-    let Some(allow) = join_rules["allow"].as_array_mut() else {
-        return Ok(());
-    };
-    let allows = |room_id: &str| {
-        allow.iter().any(|condition| {
-            condition["type"] == "m.room_membership" && condition["room_id"] == room_id
-        })
-    };
-    if !allows(room) || allows(new_room_id) {
-        return Ok(());
-    }
-    allow.push(json!({ "type": "m.room_membership", "room_id": new_room_id }));
-    put_state(
-        http_client,
-        homeserver_url,
-        other_room,
-        "m.room.join_rules",
-        "",
-        &join_rules,
-    )
-    .await?;
-    info!("Allowed members of {new_room_id} to join {other_room}");
-    Ok(())
-}
-
-/// Replaces `room` with `new_room_id` as a parent space of `other_room`, if it is one.
-async fn move_space_parent_reference(
-    http_client: &reqwest::Client,
-    homeserver_url: &str,
-    room: &str,
-    new_room_id: &str,
-    other_room: &str,
-) -> anyhow::Result<()> {
-    let Some(content) = get_state(
-        http_client,
-        homeserver_url,
-        other_room,
-        "m.space.parent",
-        room,
-    )
-    .await?
-    .filter(has_via) else {
-        return Ok(());
-    };
-    put_state(
-        http_client,
-        homeserver_url,
-        other_room,
-        "m.space.parent",
-        new_room_id,
-        &content,
-    )
-    .await?;
-    put_state(
-        http_client,
-        homeserver_url,
-        other_room,
-        "m.space.parent",
-        room,
-        &json!({}),
-    )
-    .await?;
-    info!("Replaced {room} with {new_room_id} as a parent of {other_room}");
-    Ok(())
-}
-
-/// Replaces `room` with `new_room_id` as a child of `other_room`, if it is one.
-async fn move_space_child_reference(
-    http_client: &reqwest::Client,
-    homeserver_url: &str,
-    room: &str,
-    new_room_id: &str,
-    other_room: &str,
-) -> anyhow::Result<()> {
-    let Some(content) = get_state(
-        http_client,
-        homeserver_url,
-        other_room,
-        "m.space.child",
-        room,
-    )
-    .await?
-    .filter(has_via) else {
-        return Ok(());
-    };
-    put_state(
-        http_client,
-        homeserver_url,
-        other_room,
-        "m.space.child",
-        new_room_id,
-        &content,
-    )
-    .await?;
-    put_state(
-        http_client,
-        homeserver_url,
-        other_room,
-        "m.space.child",
-        room,
-        &json!({}),
-    )
-    .await?;
-    info!("Replaced {room} with {new_room_id} in {other_room}");
-    Ok(())
 }
 
 /// Lists the aliases our server has for `room`.
