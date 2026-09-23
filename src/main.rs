@@ -237,16 +237,28 @@ async fn create_replacement_room(
 
     let target_room_version = format!("{}", config.target_room_version);
 
+    // The new room keeps the rest of the old create event, like the type that makes a room a space,
+    // or m.federate. Its creators get power through the power levels instead.
+    let mut creation_content = create["content"]
+        .as_object()
+        .context("create event content is not an object")?
+        .clone();
+    for key in ["additional_creators", "creator", "room_version"] {
+        creation_content.remove(key);
+    }
+    creation_content.insert(
+        "predecessor".to_string(),
+        json!({
+            "event_id": last_event_id,
+            "room_id": room,
+        }),
+    );
+
     let new_room_body = send(
         http_client
             .post(url(&config.homeserver_url, CLIENT_API, &["createRoom"])?)
             .json(&json!({
-                "creation_content": {
-                    "predecessor": {
-                        "event_id": last_event_id,
-                        "room_id": room,
-                    },
-                },
+                "creation_content": creation_content,
                 "room_version": target_room_version,
                 "power_level_content_override": power_levels,
                 "initial_state": initial_state,
