@@ -13,6 +13,10 @@ pub struct State {
     /// New room IDs by the ID of the room they replace, recorded before the old room is
     /// tombstoned so that an interrupted upgrade resumes with the room it already created.
     pub replacement_rooms: HashMap<String, String>,
+    /// Upgrade notice event IDs by the ID of the room they were sent in, recorded until the new
+    /// room is created so that retrying doesn't send another notice.
+    #[serde(default)]
+    pub upgrade_notices: HashMap<String, String>,
     /// Old room IDs by the alias that pointed to them, recorded before the alias is deleted so
     /// that an interrupted upgrade still points it to the new room.
     #[serde(default)]

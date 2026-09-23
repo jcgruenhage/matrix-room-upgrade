@@ -106,10 +106,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Posts an upgrade notice in `room` and creates the room replacing it, returning its ID.
+/// Posts an upgrade notice in `room`, unless a previous run did already, and creates the room
+/// replacing it, returning its ID.
 async fn create_replacement_room(
     http_client: &reqwest::Client,
     config: &config::Config,
+    state: &mut state::State,
     self_user_id: &str,
     room: &str,
 ) -> anyhow::Result<String> {
@@ -202,25 +204,34 @@ async fn create_replacement_room(
     }
     debug!("New state: {initial_state:#?}, power levels: {power_levels:#?}");
 
-    let txn_id = Uuid::new_v4();
-    let res = send(
-        http_client
-            .put(url(
-                &config.homeserver_url,
-                CLIENT_API,
-                &["rooms", room, "send", "m.room.message", &txn_id.to_string()],
-            )?)
-            .json(&json!({
-                "body": "Upgrading room, please stand by",
-                "msgtype": "m.text"
-            }
-            )),
-    )
-    .await?;
-    let last_event_id = res.json::<Value>().await?["event_id"]
-        .as_str()
-        .context("event_id is not a string")?
-        .to_string();
+    let last_event_id = if let Some(event_id) = state.upgrade_notices.get(room) {
+        event_id.clone()
+    } else {
+        let txn_id = Uuid::new_v4();
+        let res = send(
+            http_client
+                .put(url(
+                    &config.homeserver_url,
+                    CLIENT_API,
+                    &["rooms", room, "send", "m.room.message", &txn_id.to_string()],
+                )?)
+                .json(&json!({
+                    "body": "Upgrading room, please stand by",
+                    "msgtype": "m.text"
+                }
+                )),
+        )
+        .await?;
+        let event_id = res.json::<Value>().await?["event_id"]
+            .as_str()
+            .context("event_id is not a string")?
+            .to_string();
+        state
+            .upgrade_notices
+            .insert(room.to_string(), event_id.clone());
+        state.save()?;
+        event_id
+    };
 
     debug!("Last event ID: {last_event_id}");
 
@@ -547,10 +558,11 @@ async fn upgrade_room(
             new_room_id.clone()
         } else {
             let new_room_id =
-                create_replacement_room(http_client, config, self_user_id, room).await?;
+                create_replacement_room(http_client, config, state, self_user_id, room).await?;
             state
                 .replacement_rooms
                 .insert(room.to_string(), new_room_id.clone());
+            state.upgrade_notices.remove(room);
             state.save()?;
             info!("Created {new_room_id}");
             new_room_id
