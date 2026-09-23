@@ -3,7 +3,7 @@ homeserver_url: <hs_url>
 rooms:
   - '<room_id>'
 pl_overrides:
-  '<user_id>': i00
+  '<user_id>': 100
 target_room_version: 12
 state_events_to_transfer:
   - "m.room.avatar"
@@ -11,5 +11,6 @@ state_events_to_transfer:
   - "m.room.history_visibility"
   - "m.room.join_rules"
   - "m.room.name"
-  - "m.room.power_levels"
   - "m.room.topic"
+drop_members:
+  - '<user_id>'
