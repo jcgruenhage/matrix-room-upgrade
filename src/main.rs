@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 
 use anyhow::Context;
@@ -240,7 +240,27 @@ async fn main() -> anyhow::Result<()> {
                 .context("we're in the else clause of a if is_none, it should be here really")?
         };
 
+        let new_members_res = http_client
+            .get(&format!(
+                "{}/_matrix/client/v3/rooms/{new_room_id}/members",
+                config.homeserver_url
+            ))
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+        let new_members: HashSet<&str> = new_members_res["chunk"]
+            .as_array()
+            .context("members response should have array called chunk but doesn't")?
+            .iter()
+            .filter_map(|member| member["state_key"].as_str())
+            .collect();
+        dbg!(&new_members);
+
         for (user_id, reason) in banned_members.iter() {
+            if new_members.contains(user_id.as_str()) {
+                continue;
+            }
             dbg!(
                 dbg!(
                     http_client
@@ -264,6 +284,8 @@ async fn main() -> anyhow::Result<()> {
             if dbg!(config.drop_members.contains(dbg!(user_id))) {
                 continue;
             } else if &self_user_id == user_id {
+                continue;
+            } else if new_members.contains(user_id.as_str()) {
                 continue;
             }
             dbg!(
