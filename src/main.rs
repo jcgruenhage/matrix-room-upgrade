@@ -18,13 +18,16 @@ mod config;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
-    let config_file = File::open(cli.config)?;
-    let config: config::Config = serde_yaml::from_reader(config_file)?;
+    let config_file = File::open(&cli.config)
+        .with_context(|| format!("failed to open {}", cli.config.display()))?;
+    let config: config::Config = serde_yaml::from_reader(config_file)
+        .with_context(|| format!("failed to parse {}", cli.config.display()))?;
 
     let mut headers = header::HeaderMap::new();
     headers.insert(
         header::AUTHORIZATION,
-        header::HeaderValue::from_str(&format!("Bearer {}", config.access_token))?,
+        header::HeaderValue::from_str(&format!("Bearer {}", config.access_token))
+            .context("access token is not a valid header value")?,
     );
 
     let http_client = reqwest::Client::builder()
@@ -43,7 +46,10 @@ async fn main() -> anyhow::Result<()> {
         .json::<Value>()
         .await
     )?;
-    let self_user_id = dbg!(self_user_id_res["user_id"].as_str().unwrap().to_string());
+    let self_user_id = dbg!(self_user_id_res["user_id"]
+        .as_str()
+        .context("whoami response has no user_id")?
+        .to_string());
 
     let mut failed_rooms = Vec::new();
     for room in &config.rooms {
@@ -75,11 +81,9 @@ async fn upgrade_room(
     let new_room_id = if let Some(tombstone_content) = tombstone {
         println!("Room upgraded already, only transferring membership state");
         Some(
-            tombstone_content
-                .get("replacement_room")
-                .context("no replacement_room, should be part of tombstone event")?
+            tombstone_content["replacement_room"]
                 .as_str()
-                .context("no string wtf")?
+                .context("tombstone has no replacement_room")?
                 .to_string(),
         )
     } else {
@@ -103,25 +107,19 @@ async fn upgrade_room(
         .iter()
     {
         dbg!(member);
-        match member["content"]["membership"].as_str().unwrap() {
-            "join" => joined_members.push((
-                member["state_key"].as_str().unwrap().to_string(),
-                member["content"]["reason"]
-                    .as_str()
-                    .map(|str| str.to_string()),
-            )),
-            "invite" => joined_members.push((
-                member["state_key"].as_str().unwrap().to_string(),
-                member["content"]["reason"]
-                    .as_str()
-                    .map(|str| str.to_string()),
-            )),
-            "ban" => banned_members.push((
-                member["state_key"].as_str().unwrap().to_string(),
-                member["content"]["reason"]
-                    .as_str()
-                    .map(|str| str.to_string()),
-            )),
+        let membership = member["content"]["membership"]
+            .as_str()
+            .context("member event has no membership")?;
+        let entry = (
+            member["state_key"]
+                .as_str()
+                .context("member event has no state_key")?
+                .to_string(),
+            member["content"]["reason"].as_str().map(str::to_string),
+        );
+        match membership {
+            "join" | "invite" => joined_members.push(entry),
+            "ban" => banned_members.push(entry),
             _ => {}
         }
     }
@@ -129,7 +127,9 @@ async fn upgrade_room(
     dbg!(&banned_members);
     dbg!(&joined_members);
 
-    let new_room_id = if new_room_id.is_none() {
+    let new_room_id = if let Some(new_room_id) = new_room_id {
+        new_room_id
+    } else {
         let mut power_levels = get_state(
             http_client,
             &config.homeserver_url,
@@ -249,8 +249,6 @@ async fn upgrade_room(
         .json::<Value>()
         .await?;
         new_room_id.to_string()
-    } else {
-        new_room_id.context("we're in the else clause of a if is_none, it should be here really")?
     };
 
     let new_members_res = send(http_client.get(format!(
@@ -360,12 +358,12 @@ async fn error_for_status(res: reqwest::Response) -> anyhow::Result<reqwest::Res
 /// Sends a request, retrying while the server rate limits us. Waits as long as the server asks
 /// via `Retry-After` or `retry_after_ms`, otherwise backs off exponentially up to `MAX_BACKOFF`.
 async fn send_retrying(request: reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
+    let (client, request) = request.build_split();
+    let request = request?;
     let mut backoff = INITIAL_BACKOFF;
     loop {
-        let res = request
-            .try_clone()
-            .context("request should be cloneable")?
-            .send()
+        let res = client
+            .execute(request.try_clone().context("request should be cloneable")?)
             .await?;
         if res.status() != StatusCode::TOO_MANY_REQUESTS {
             return Ok(res);
