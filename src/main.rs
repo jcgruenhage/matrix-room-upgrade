@@ -197,6 +197,30 @@ async fn upgrade_room(
     room: &str,
 ) -> anyhow::Result<()> {
     info!("Upgrading {room}");
+    let joined_rooms = send(http_client.get(format!(
+        "{}/_matrix/client/v3/joined_rooms",
+        config.homeserver_url
+    )))
+    .await?
+    .json::<Value>()
+    .await?;
+    if !joined_rooms["joined_rooms"]
+        .as_array()
+        .context("joined_rooms response has no joined_rooms")?
+        .iter()
+        .any(|joined_room| joined_room == room)
+    {
+        send(
+            http_client
+                .post(format!(
+                    "{}/_matrix/client/v3/rooms/{room}/join",
+                    config.homeserver_url
+                ))
+                .json(&json!({})),
+        )
+        .await?;
+        info!("Joined {room}");
+    }
     let tombstone = get_state(
         http_client,
         &config.homeserver_url,
