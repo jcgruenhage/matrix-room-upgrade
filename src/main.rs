@@ -296,6 +296,8 @@ async fn upgrade_room(
         &new_room_id,
     )
     .await?;
+    let mut failures =
+        move_space_parents(http_client, &config.homeserver_url, room, &new_room_id).await?;
 
     let new_members_res = send(http_client.get(format!(
         "{}/_matrix/client/v3/rooms/{new_room_id}/members",
@@ -312,7 +314,6 @@ async fn upgrade_room(
         .collect();
     debug!("Members in the new room: {new_members:?}");
 
-    let mut failures = 0;
     for (user_id, reason) in banned_members.iter() {
         if new_members.contains(user_id.as_str()) {
             continue;
@@ -365,7 +366,7 @@ async fn upgrade_room(
     }
     anyhow::ensure!(
         failures == 0,
-        "{failures} bans/invites in {new_room_id} failed, re-run to retry them"
+        "{failures} space updates, bans or invites failed, re-run to retry them"
     );
     Ok(())
 }
@@ -556,6 +557,110 @@ async fn move_aliases(
         info!("Replaced {room} with {new_room_id} in the room directory");
     }
     Ok(())
+}
+
+/// Replaces `room` with `new_room_id` in the spaces that `room` names as its parents, and names
+/// those spaces as parents of the new room. Returns how many spaces couldn't be updated, e.g.
+/// because we lack the power level to change them.
+async fn move_space_parents(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    room: &str,
+    new_room_id: &str,
+) -> anyhow::Result<usize> {
+    let state = send(http_client.get(format!(
+        "{homeserver_url}/_matrix/client/v3/rooms/{room}/state"
+    )))
+    .await?
+    .json::<Value>()
+    .await?;
+    let mut failures = 0;
+    for event in state.as_array().context("state response is not an array")? {
+        if event["type"] != "m.space.parent" || !has_via(&event["content"]) {
+            continue;
+        }
+        let space = event["state_key"]
+            .as_str()
+            .context("space parent event has no state_key")?;
+        if let Err(err) = move_space_parent(
+            http_client,
+            homeserver_url,
+            room,
+            new_room_id,
+            space,
+            &event["content"],
+        )
+        .await
+        {
+            warn!("Failed to replace {room} with {new_room_id} in {space}: {err:#}");
+            failures += 1;
+        }
+    }
+    Ok(failures)
+}
+
+/// Names `space` as a parent of `new_room_id` and, if `space` still lists `room` as a child,
+/// replaces it with `new_room_id` there.
+async fn move_space_parent(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    room: &str,
+    new_room_id: &str,
+    space: &str,
+    parent_content: &Value,
+) -> anyhow::Result<()> {
+    let new_parent_content = get_state(
+        http_client,
+        homeserver_url,
+        new_room_id,
+        "m.space.parent",
+        space,
+    )
+    .await?;
+    if new_parent_content.as_ref() != Some(parent_content) {
+        put_state(
+            http_client,
+            homeserver_url,
+            new_room_id,
+            "m.space.parent",
+            space,
+            parent_content,
+        )
+        .await?;
+    }
+
+    let Some(child_content) = get_state(http_client, homeserver_url, space, "m.space.child", room)
+        .await?
+        .filter(has_via)
+    else {
+        return Ok(());
+    };
+    put_state(
+        http_client,
+        homeserver_url,
+        space,
+        "m.space.child",
+        new_room_id,
+        &child_content,
+    )
+    .await?;
+    put_state(
+        http_client,
+        homeserver_url,
+        space,
+        "m.space.child",
+        room,
+        &json!({}),
+    )
+    .await?;
+    info!("Replaced {room} with {new_room_id} in {space}");
+    Ok(())
+}
+
+/// Whether the content of an `m.space.child` or `m.space.parent` event lists servers in `via`,
+/// without which the spec treats the relationship as nonexistent.
+fn has_via(content: &Value) -> bool {
+    content["via"].as_array().is_some_and(|via| !via.is_empty())
 }
 
 /// Lists the `alias` and `alt_aliases` in the content of an `m.room.canonical_alias` event.
