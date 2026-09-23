@@ -67,9 +67,28 @@ async fn main() -> anyhow::Result<()> {
         .to_string();
     debug!("Logged in as {self_user_id}");
 
+    // Prepare all rooms first, so that everything that needs asking is asked up front.
     let mut failed_rooms = Vec::new();
+    let mut prepared_rooms = Vec::new();
     for room in &config.rooms {
-        if let Err(err) = upgrade_room(&http_client, &config, &mut state, &self_user_id, room).await
+        match prepare_room(&http_client, &config.homeserver_url, &self_user_id, room).await {
+            Ok(steps) => prepared_rooms.push((room, steps)),
+            Err(err) => {
+                error!("Failed to prepare {room}: {err:#}");
+                failed_rooms.push(room);
+            }
+        }
+    }
+    for (room, steps) in prepared_rooms {
+        if let Err(err) = upgrade_room(
+            &http_client,
+            &config,
+            &mut state,
+            &self_user_id,
+            room,
+            steps,
+        )
+        .await
         {
             error!("Failed to upgrade {room}: {err:#}");
             failed_rooms.push(room);
@@ -428,9 +447,9 @@ async fn upgrade_room(
     state: &mut state::State,
     self_user_id: &str,
     room: &str,
+    steps: Steps,
 ) -> anyhow::Result<()> {
     info!("Upgrading {room}");
-    let steps = prepare_room(http_client, &config.homeserver_url, self_user_id, room).await?;
     let tombstone = get_state(
         http_client,
         &config.homeserver_url,
