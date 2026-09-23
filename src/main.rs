@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -25,6 +26,55 @@ static DRY_RUN: AtomicBool = AtomicBool::new(false);
 
 fn dry_run() -> bool {
     DRY_RUN.load(Ordering::Relaxed)
+}
+
+/// How to refer to the rooms whose state we fetched in logs and questions, by their ID.
+static ROOM_LABELS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+/// Remembers how to refer to `room` in logs and questions, going by the name, canonical alias and
+/// type in `room_state`.
+fn remember_label(room: &str, room_state: &[Value]) {
+    let content = |event_type: &str| {
+        room_state
+            .iter()
+            .find(|event| event["type"] == event_type && event["state_key"] == "")
+            .map(|event| &event["content"])
+    };
+    let name = content("m.room.name")
+        .and_then(|content| content["name"].as_str())
+        .filter(|name| !name.is_empty());
+    let alias = content("m.room.canonical_alias").and_then(|content| content["alias"].as_str());
+    let mut details = Vec::new();
+    if content("m.room.create").is_some_and(|content| content["type"] == "m.space") {
+        details.push("space");
+    }
+    let main = match (name, alias) {
+        (Some(name), alias) => {
+            details.extend(alias);
+            details.push(room);
+            format!("\"{name}\"")
+        }
+        (None, Some(alias)) => {
+            details.push(room);
+            alias.to_string()
+        }
+        (None, None) if details.is_empty() => return,
+        (None, None) => room.to_string(),
+    };
+    let label = format!("{main} ({})", details.join(", "));
+    if let Ok(mut labels) = ROOM_LABELS.lock() {
+        labels.insert(room.to_string(), label);
+    }
+}
+
+/// How to refer to `room` in logs and questions: by its name, canonical alias and whether it's a
+/// space, as far as we know them, and its ID.
+fn label(room: &str) -> String {
+    ROOM_LABELS
+        .lock()
+        .ok()
+        .and_then(|labels| labels.get(room).cloned())
+        .unwrap_or_else(|| room.to_string())
 }
 
 mod cli;
@@ -90,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(Some(steps)) => prepared_rooms.push((room, steps)),
             Ok(None) => {}
             Err(err) => {
-                error!("Failed to prepare {room}: {err:#}");
+                error!("Failed to prepare {room}: {err:#}", room = label(room));
                 failures.add("preparing rooms");
             }
         }
@@ -109,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
             {
-                error!("Failed to upgrade {room}: {err:#}");
+                error!("Failed to upgrade {room}: {err:#}", room = label(room));
                 failures.add("upgrading rooms");
             }
         }
@@ -315,10 +365,12 @@ async fn create_replacement_room(
     .await?
     .json::<Value>()
     .await?;
-    Ok(new_room_body["room_id"]
+    let new_room_id = new_room_body["room_id"]
         .as_str()
-        .context("room id is not a string")?
-        .to_string())
+        .context("room id is not a string")?;
+    // The new room has the old room's name and type, and gets its canonical alias.
+    remember_label(new_room_id, &room_state);
+    Ok(new_room_id.to_string())
 }
 
 /// The optional steps of upgrading a room that we have enough power for, or were told to do
@@ -345,7 +397,10 @@ async fn prepare_room(
         Some(room_state) => (true, room_state),
         None => {
             if !join(http_client, homeserver_url, room).await? {
-                warn!("Can't check {room} without joining it or using the admin API");
+                warn!(
+                    "Can't check {room} without joining it or using the admin API",
+                    room = label(room)
+                );
                 return Ok(None);
             }
             (false, room_state(http_client, homeserver_url, room).await?)
@@ -404,7 +459,8 @@ async fn prepare_room(
 
     anyhow::ensure!(
         level >= upgrade,
-        "we have power level {level} in {room}, but need {upgrade} to upgrade it"
+        "we have power level {level} in {room}, but need {upgrade} to upgrade it",
+        room = label(room)
     );
     let do_step = |step: &str, required: Int| {
         if level >= required {
@@ -454,7 +510,10 @@ fn describe_upgrade(
         .find("m.room.tombstone", "")
         .and_then(|tombstone| tombstone["content"]["replacement_room"].as_str())
     {
-        Some(replacement) => steps.push(format!("finish upgrading it to {replacement}")),
+        Some(replacement) => steps.push(format!(
+            "finish upgrading it to {replacement}",
+            replacement = label(replacement)
+        )),
         None => {
             let transferred: Vec<&str> = config
                 .state_events_to_transfer
@@ -493,7 +552,11 @@ fn describe_upgrade(
         }
     }
     steps.push(format!("invite {invites} and ban {bans} members"));
-    format!("Would upgrade {room}: {}", steps.join(", "))
+    format!(
+        "Would upgrade {room}: {}",
+        steps.join(", "),
+        room = label(room)
+    )
 }
 
 /// Fetches the state of `room` through the admin API, which also works for rooms we aren't in, or
@@ -511,7 +574,9 @@ async fn admin_room_state(
         return Ok(None);
     }
     let mut body = error_for_status(res).await?.json::<Value>().await?;
-    Ok(Some(serde_json::from_value(body["state"].take())?))
+    let room_state: Vec<Value> = serde_json::from_value(body["state"].take())?;
+    remember_label(room, &room_state);
+    Ok(Some(room_state))
 }
 
 /// Whether we can use the admin API. Only server admins can use it, and reverse proxies often
@@ -540,12 +605,13 @@ async fn room_state(
     homeserver_url: &str,
     room: &str,
 ) -> anyhow::Result<Vec<Value>> {
-    Ok(
+    let room_state: Vec<Value> =
         send(http_client.get(url(homeserver_url, CLIENT_API, &["rooms", room, "state"])?))
             .await?
             .json()
-            .await?,
-    )
+            .await?;
+    remember_label(room, &room_state);
+    Ok(room_state)
 }
 
 /// Who has how much power in a room, and how much power doing things there needs, going by the
@@ -722,7 +788,10 @@ async fn offer_make_room_admin(
         return Ok(level);
     }
     if dry_run() {
-        info!("Would get power level {granted} in {room} through {admin_user}");
+        info!(
+            "Would get power level {granted} in {room} through {admin_user}",
+            room = label(room)
+        );
         return Ok(granted);
     }
     send(
@@ -735,7 +804,10 @@ async fn offer_make_room_admin(
             .json(&json!({})),
     )
     .await?;
-    info!("Got power level {granted} in {room} through {admin_user}");
+    info!(
+        "Got power level {granted} in {room} through {admin_user}",
+        room = label(room)
+    );
     Ok(granted)
 }
 
@@ -752,7 +824,7 @@ async fn join(
         .any(|joined_room| joined_room == room)
     {
         if dry_run() {
-            info!("Would join {room}");
+            info!("Would join {room}", room = label(room));
             return Ok(false);
         }
         send(
@@ -761,7 +833,7 @@ async fn join(
                 .json(&json!({})),
         )
         .await?;
-        info!("Joined {room}");
+        info!("Joined {room}", room = label(room));
     }
     Ok(true)
 }
@@ -806,7 +878,7 @@ async fn upgrade_room(
     steps: Steps,
     failures: &mut Failures,
 ) -> anyhow::Result<()> {
-    info!("Upgrading {room}");
+    info!("Upgrading {room}", room = label(room));
     let tombstone = get_state(
         http_client,
         &config.homeserver_url,
@@ -820,7 +892,11 @@ async fn upgrade_room(
             .as_str()
             .context("tombstone has no replacement_room")?
             .to_string();
-        info!("{room} was already upgraded to {new_room_id}, only transferring membership");
+        info!(
+            "{room} was already upgraded to {new_room_id}, only transferring membership",
+            room = label(room),
+            new_room_id = label(&new_room_id)
+        );
         // Someone else may have upgraded the room.
         join(http_client, &config.homeserver_url, &new_room_id).await?;
         Some(new_room_id)
@@ -872,7 +948,10 @@ async fn upgrade_room(
         new_room_id
     } else {
         let new_room_id = if let Some(new_room_id) = state.replacement_rooms.get(room) {
-            info!("Resuming the upgrade to {new_room_id}, which was created on a previous run");
+            info!(
+                "Resuming the upgrade to {new_room_id}, which was created on a previous run",
+                new_room_id = label(new_room_id)
+            );
             new_room_id.clone()
         } else {
             let new_room_id =
@@ -882,7 +961,7 @@ async fn upgrade_room(
                 .insert(room.to_string(), new_room_id.clone());
             state.upgrade_notices.remove(room);
             state.save()?;
-            info!("Created {new_room_id}");
+            info!("Created {new_room_id}", new_room_id = label(&new_room_id));
             new_room_id
         };
 
@@ -898,7 +977,7 @@ async fn upgrade_room(
             }),
         )
         .await?;
-        info!("Tombstoned {room}");
+        info!("Tombstoned {room}", room = label(room));
         // The tombstone records the new room from here on.
         if state.replacement_rooms.remove(room).is_some() {
             state.save()?;
@@ -906,13 +985,13 @@ async fn upgrade_room(
         new_room_id
     };
     if !steps.lock_down {
-        warn!("Not locking down {room}");
+        warn!("Not locking down {room}", room = label(room));
     } else if let Err(err) = restrict_old_room(http_client, &config.homeserver_url, room).await {
-        warn!("Failed to lock down {room}: {err:#}");
+        warn!("Failed to lock down {room}: {err:#}", room = label(room));
         failures.add("locking down rooms");
     }
     if !steps.move_aliases {
-        warn!("Not moving the aliases of {room}");
+        warn!("Not moving the aliases of {room}", room = label(room));
     } else if let Err(err) = move_aliases(
         http_client,
         &config.homeserver_url,
@@ -923,7 +1002,10 @@ async fn upgrade_room(
     )
     .await
     {
-        warn!("Failed to move the aliases of {room}: {err:#}");
+        warn!(
+            "Failed to move the aliases of {room}: {err:#}",
+            room = label(room)
+        );
         failures.add("moving aliases");
     }
 
@@ -1031,7 +1113,10 @@ async fn restrict_old_room(
             &power_levels,
         )
         .await?;
-        info!("Raised the power level to send events and invite in {room} to {restricted}");
+        info!(
+            "Raised the power level to send events and invite in {room} to {restricted}",
+            room = label(room)
+        );
     }
 
     // A room without join rules is invite only already.
@@ -1046,7 +1131,7 @@ async fn restrict_old_room(
             &json!({ "join_rule": "invite" }),
         )
         .await?;
-        info!("Made {room} invite only");
+        info!("Made {room} invite only", room = label(room));
     }
     Ok(())
 }
@@ -1101,7 +1186,11 @@ async fn move_aliases(
         match resolve_alias(http_client, homeserver_url, alias).await? {
             Some(target) if target == new_room_id => {}
             Some(target) if target != room => {
-                warn!("{alias} points to {target} instead of {room}, leaving it alone");
+                warn!(
+                    "{alias} points to {target} instead of {room}, leaving it alone",
+                    room = label(room),
+                    target = label(&target)
+                );
             }
             target => {
                 if target.is_some() {
@@ -1115,7 +1204,10 @@ async fn move_aliases(
                         .json(&json!({ "room_id": new_room_id })),
                 )
                 .await?;
-                info!("Pointed {alias} to {new_room_id}");
+                info!(
+                    "Pointed {alias} to {new_room_id}",
+                    new_room_id = label(new_room_id)
+                );
             }
         }
         if state.moving_aliases.remove(alias).is_some() {
@@ -1165,7 +1257,11 @@ async fn move_aliases(
             &json!({}),
         )
         .await?;
-        info!("Moved the canonical alias of {room} to {new_room_id}");
+        info!(
+            "Moved the canonical alias of {room} to {new_room_id}",
+            room = label(room),
+            new_room_id = label(new_room_id)
+        );
     }
 
     if is_published(http_client, homeserver_url, room).await? {
@@ -1183,10 +1279,18 @@ async fn move_aliases(
         // Servers can restrict who may publish rooms, which won't change by retrying, so this
         // doesn't fail the upgrade. The old room stays published to not drop out of the directory.
         if let Err(err) = set_visibility(new_room_id, "public")?.await {
-            warn!("Failed to publish {new_room_id}, leaving {room} published instead: {err:#}");
+            warn!(
+                "Failed to publish {new_room_id}, leaving {room} published instead: {err:#}",
+                room = label(room),
+                new_room_id = label(new_room_id)
+            );
         } else {
             set_visibility(room, "private")?.await?;
-            info!("Replaced {room} with {new_room_id} in the room directory");
+            info!(
+                "Replaced {room} with {new_room_id} in the room directory",
+                room = label(room),
+                new_room_id = label(new_room_id)
+            );
         }
     }
     Ok(())
@@ -1272,7 +1376,11 @@ fn outdated_references(
                     .as_str()
                     .and_then(|old| Some((old.to_string(), latest(old)?)))
                 {
-                    replaced.push(format!("{old} with {new}"));
+                    replaced.push(format!(
+                        "{old} with {new}",
+                        old = label(&old),
+                        new = label(new)
+                    ));
                     upgraded_rooms.push(old);
                     condition["room_id"] = json!(new);
                 }
@@ -1287,7 +1395,8 @@ fn outdated_references(
             changes.push(Change {
                 description: format!(
                     "Replace {} in the join rules of {room}",
-                    replaced.join(", ")
+                    replaced.join(", "),
+                    room = label(room)
                 ),
                 upgraded_rooms,
                 events: vec![("m.room.join_rules", String::new(), content)],
@@ -1315,9 +1424,19 @@ fn outdated_references(
         }
         events.push((event_type, old.to_string(), json!({})));
         let description = if event_type == "m.space.parent" {
-            format!("Replace {old} with {new} as a parent space of {room}")
+            format!(
+                "Replace {old} with {new} as a parent space of {room}",
+                room = label(room),
+                old = label(old),
+                new = label(new)
+            )
         } else {
-            format!("Replace {old} with {new} as a child of {room}")
+            format!(
+                "Replace {old} with {new} as a child of {room}",
+                room = label(room),
+                old = label(old),
+                new = label(new)
+            )
         };
         changes.push(Change {
             description,
@@ -1354,7 +1473,10 @@ async fn plan_fixes(
         match room_state(http_client, homeserver_url, &room).await {
             Ok(room_state) => room_states.push((room, room_state)),
             Err(err) => {
-                warn!("Failed to get the state of {room}: {err:#}");
+                warn!(
+                    "Failed to get the state of {room}: {err:#}",
+                    room = label(&room)
+                );
                 failures.add("getting the state of rooms");
             }
         }
@@ -1373,7 +1495,7 @@ async fn plan_fixes(
     for room in &config.rooms {
         planned_replacements
             .entry(room.clone())
-            .or_insert_with(|| format!("the replacement of {room}"));
+            .or_insert_with(|| format!("the replacement of {room}", room = label(room)));
     }
 
     let admin_api = admin_api_available(http_client, homeserver_url, self_user_id).await?;
@@ -1387,10 +1509,15 @@ async fn plan_fixes(
                     Ok(left_behind) if left_behind.is_empty() => {}
                     Ok(left_behind) => warn!(
                         "{room} was upgraded to {replacement}, but {} still point to it",
-                        left_behind.join(", ")
+                        left_behind.join(", "),
+                        room = label(room),
+                        replacement = label(replacement)
                     ),
                     Err(err) => {
-                        warn!("Failed to check whether aliases still point to {room}: {err:#}");
+                        warn!(
+                            "Failed to check whether aliases still point to {room}: {err:#}",
+                            room = label(room)
+                        );
                         failures.add("checking for aliases of upgraded rooms");
                     }
                 }
@@ -1400,7 +1527,10 @@ async fn plan_fixes(
             if configured.contains(room.as_str())
                 || needed == int!(0)
                 || !confirm(format!(
-                    "{room} was upgraded to {replacement}, but isn't locked down yet. Lock it down?"
+                    "{room} was upgraded to {replacement}, but isn't locked down yet. \
+                     Lock it down?",
+                    room = label(room),
+                    replacement = label(replacement)
                 ))?
             {
                 continue;
@@ -1418,11 +1548,14 @@ async fn plan_fixes(
                 .await?;
             }
             if level < needed {
-                warn!("Not locking down {room}, as we have power level {level} but need {needed}");
+                warn!(
+                    "Not locking down {room}, as we have power level {level} but need {needed}",
+                    room = label(room)
+                );
             } else if dry_run() {
-                info!("Would lock down {room}");
+                info!("Would lock down {room}", room = label(room));
             } else if let Err(err) = restrict_old_room(http_client, homeserver_url, room).await {
-                warn!("Failed to lock down {room}: {err:#}");
+                warn!("Failed to lock down {room}: {err:#}", room = label(room));
                 failures.add("locking down rooms");
             }
             continue;
@@ -1487,7 +1620,10 @@ async fn apply_fixes(
             match get_state(http_client, homeserver_url, room, "m.room.tombstone", "").await {
                 Ok(tombstone) => tombstone,
                 Err(err) => {
-                    warn!("Failed to find out what {room} was upgraded to: {err:#}");
+                    warn!(
+                        "Failed to find out what {room} was upgraded to: {err:#}",
+                        room = label(room)
+                    );
                     failures.add("updating references to upgraded rooms");
                     continue;
                 }
@@ -1514,7 +1650,10 @@ async fn apply_fixes(
         let room_state = match room_state(http_client, homeserver_url, &room).await {
             Ok(room_state) => room_state,
             Err(err) => {
-                warn!("Failed to get the state of {room}: {err:#}");
+                warn!(
+                    "Failed to get the state of {room}: {err:#}",
+                    room = label(&room)
+                );
                 failures.add("updating references to upgraded rooms");
                 continue;
             }
