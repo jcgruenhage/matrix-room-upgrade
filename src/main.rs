@@ -587,6 +587,7 @@ async fn upgrade_room(
     } else if let Err(err) = move_aliases(
         http_client,
         &config.homeserver_url,
+        state,
         self_user_id,
         room,
         &new_room_id,
@@ -730,12 +731,13 @@ async fn restrict_old_room(
 ///
 /// Every step checks where things point now instead of assuming they haven't moved yet, so that
 /// an interrupted run can be resumed: aliases on our server are made to point to the new room
-/// whether they still point to the old one or were already deleted from it. Aliases on other
-/// servers can't be moved and are dropped from the canonical alias unless they already point to
-/// the new room.
+/// whether they still point to the old one or were already deleted from it, which `state`
+/// remembers for aliases that aren't in the canonical alias. Aliases on other servers can't be
+/// moved and are dropped from the canonical alias unless they already point to the new room.
 async fn move_aliases(
     http_client: &reqwest::Client,
     homeserver_url: &str,
+    state: &mut state::State,
     self_user_id: &str,
     room: &str,
     new_room_id: &str,
@@ -762,27 +764,39 @@ async fn move_aliases(
                 .map(str::to_string),
         );
     }
+    aliases.extend(
+        state
+            .moving_aliases
+            .iter()
+            .filter(|(_, old_room)| *old_room == room)
+            .map(|(alias, _)| alias.clone()),
+    );
 
     for alias in &aliases {
         let alias_url = url(homeserver_url, CLIENT_API, &["directory", "room", alias])?;
         match resolve_alias(http_client, homeserver_url, alias).await? {
-            Some(target) if target == new_room_id => continue,
-            Some(target) if target == room => {
-                send(http_client.delete(alias_url.clone())).await?;
-            }
-            Some(target) => {
+            Some(target) if target == new_room_id => {}
+            Some(target) if target != room => {
                 warn!("{alias} points to {target} instead of {room}, leaving it alone");
-                continue;
             }
-            None => {}
+            target => {
+                if target.is_some() {
+                    state.moving_aliases.insert(alias.clone(), room.to_string());
+                    state.save()?;
+                    send(http_client.delete(alias_url.clone())).await?;
+                }
+                send(
+                    http_client
+                        .put(alias_url)
+                        .json(&json!({ "room_id": new_room_id })),
+                )
+                .await?;
+                info!("Pointed {alias} to {new_room_id}");
+            }
         }
-        send(
-            http_client
-                .put(alias_url)
-                .json(&json!({ "room_id": new_room_id })),
-        )
-        .await?;
-        info!("Pointed {alias} to {new_room_id}");
+        if state.moving_aliases.remove(alias).is_some() {
+            state.save()?;
+        }
     }
 
     if let Some(mut canonical_alias) = canonical_alias {
