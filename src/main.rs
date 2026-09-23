@@ -130,6 +130,32 @@ async fn create_replacement_room(
         .as_object_mut()
         .context("PL state key users is not an object")?;
 
+    // The creators of the old room lose their unlimited power in the new one, so they get as much
+    // power as anyone else has instead, but at least 100, unless they are dropped.
+    let room_state = send(http_client.get(format!(
+        "{}/_matrix/client/v3/rooms/{room}/state",
+        config.homeserver_url
+    )))
+    .await?
+    .json::<Value>()
+    .await?;
+    let create = room_state
+        .as_array()
+        .context("room state is not an array")?
+        .iter()
+        .find(|event| event["type"] == "m.room.create" && event["state_key"] == "")
+        .context("room has no create event")?;
+    let creator_level = users
+        .iter()
+        .map(|(user, level)| parse_power_level(user, level))
+        .try_fold(int!(100), |max, level| anyhow::Ok(max.max(level?)))?;
+    for creator in creators(create)
+        .into_iter()
+        .filter(|creator| !config.drop_members.iter().any(|member| member == creator))
+    {
+        users.insert(creator.to_string(), json!(creator_level));
+    }
+
     for (user_id, pl) in config.pl_overrides.iter() {
         if users_default == *pl {
             users.remove(user_id);
@@ -255,23 +281,7 @@ async fn prepare_room(
             .find(|event| event["type"] == event_type && event["state_key"] == state_key)
     };
 
-    let create = find("m.room.create", "").context("room has no create event")?;
-    // From room version 12 on, creators have unlimited power and aren't in the power levels.
-    let creators: Vec<&str> = if create["content"]["room_version"]
-        .as_str()
-        .and_then(|version| version.parse::<u32>().ok())
-        .is_some_and(|version| version >= 12)
-    {
-        create["content"]["additional_creators"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .chain(create["sender"].as_str())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let creators = creators(find("m.room.create", "").context("room has no create event")?);
     let power_levels = match find("m.room.power_levels", "") {
         Some(power_levels) if !creators.contains(&self_user_id) => power_levels,
         _ => {
@@ -920,6 +930,26 @@ async fn move_space_parent(
     .await?;
     info!("Replaced {room} with {new_room_id} in {space}");
     Ok(())
+}
+
+/// Lists the users with unlimited power in a room, given its `m.room.create` event. From room
+/// version 12 on, these are its creators, who aren't in the power levels.
+fn creators(create: &Value) -> Vec<&str> {
+    if create["content"]["room_version"]
+        .as_str()
+        .and_then(|version| version.parse::<u32>().ok())
+        .is_some_and(|version| version >= 12)
+    {
+        create["content"]["additional_creators"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .chain(create["sender"].as_str())
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Whether the content of an `m.space.child` or `m.space.parent` event lists servers in `via`,
