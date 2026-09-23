@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs::File;
 use std::time::Duration;
 
@@ -73,14 +74,14 @@ async fn main() -> anyhow::Result<()> {
     debug!("Logged in as {self_user_id}");
 
     // Prepare all rooms first, so that everything that needs asking is asked up front.
-    let mut failed_rooms = Vec::new();
+    let mut failures = Failures::default();
     let mut prepared_rooms = Vec::new();
     for room in &config.rooms {
         match prepare_room(&http_client, &config.homeserver_url, &self_user_id, room).await {
             Ok(steps) => prepared_rooms.push((room, steps)),
             Err(err) => {
                 error!("Failed to prepare {room}: {err:#}");
-                failed_rooms.push(room);
+                failures.add("preparing rooms");
             }
         }
     }
@@ -92,23 +93,45 @@ async fn main() -> anyhow::Result<()> {
             &self_user_id,
             room,
             steps,
+            &mut failures,
         )
         .await
         {
             error!("Failed to upgrade {room}: {err:#}");
-            failed_rooms.push(room);
+            failures.add("upgrading rooms");
         }
     }
-    let failures = fix_outdated_references(&http_client, &config, &self_user_id).await?;
+    fix_outdated_references(&http_client, &config, &self_user_id, &mut failures).await?;
     anyhow::ensure!(
-        failed_rooms.is_empty(),
-        "failed to upgrade {failed_rooms:?}"
-    );
-    anyhow::ensure!(
-        failures == 0,
-        "{failures} references to upgraded rooms couldn't be updated, re-run to retry them"
+        failures.0.is_empty(),
+        "some steps failed, see the warnings above and re-run to retry them: {failures}"
     );
     Ok(())
+}
+
+/// How often each kind of step failed, to sum them up at the end.
+#[derive(Default)]
+struct Failures(Vec<(&'static str, usize)>);
+
+impl Failures {
+    /// Counts a failure of the step `kind` describes, like "inviting users".
+    fn add(&mut self, kind: &'static str) {
+        match self.0.iter_mut().find(|(other, _)| *other == kind) {
+            Some((_, count)) => *count += 1,
+            None => self.0.push((kind, 1)),
+        }
+    }
+}
+
+impl fmt::Display for Failures {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kinds: Vec<_> = self
+            .0
+            .iter()
+            .map(|(kind, count)| format!("{kind} ({count})"))
+            .collect();
+        f.write_str(&kinds.join(", "))
+    }
 }
 
 /// Posts an upgrade notice in `room`, unless a previous run did already, and creates the room
@@ -679,6 +702,7 @@ async fn upgrade_room(
     self_user_id: &str,
     room: &str,
     steps: Steps,
+    failures: &mut Failures,
 ) -> anyhow::Result<()> {
     info!("Upgrading {room}");
     let tombstone = get_state(
@@ -779,12 +803,11 @@ async fn upgrade_room(
         }
         new_room_id
     };
-    let mut failures = 0;
     if !steps.lock_down {
         warn!("Not locking down {room}");
     } else if let Err(err) = restrict_old_room(http_client, &config.homeserver_url, room).await {
         warn!("Failed to lock down {room}: {err:#}");
-        failures += 1;
+        failures.add("locking down rooms");
     }
     if !steps.move_aliases {
         warn!("Not moving the aliases of {room}");
@@ -799,7 +822,7 @@ async fn upgrade_room(
     .await
     {
         warn!("Failed to move the aliases of {room}: {err:#}");
-        failures += 1;
+        failures.add("moving aliases");
     }
 
     let new_members_res = send(http_client.get(url(
@@ -837,7 +860,7 @@ async fn upgrade_room(
         .await
         {
             warn!("Failed to ban {user_id}: {err:#}");
-            failures += 1;
+            failures.add("banning users");
         } else {
             debug!("Banned {user_id}");
         }
@@ -865,15 +888,11 @@ async fn upgrade_room(
         .await
         {
             warn!("Failed to invite {user_id}: {err:#}");
-            failures += 1;
+            failures.add("inviting users");
         } else {
             debug!("Invited {user_id}");
         }
     }
-    anyhow::ensure!(
-        failures == 0,
-        "{failures} steps of the upgrade failed, re-run to retry them"
-    );
     Ok(())
 }
 
@@ -1197,21 +1216,21 @@ fn outdated_references(
 /// Makes the rooms we're in refer to the current replacements of upgraded rooms, in their join
 /// rules and space hierarchy, and locks down the upgraded rooms we're in that aren't yet. Rooms in
 /// the config and their replacements are changed right away, any other room only if the user
-/// confirms. Returns how many changes failed.
+/// confirms.
 async fn fix_outdated_references(
     http_client: &reqwest::Client,
     config: &config::Config,
     self_user_id: &str,
-) -> anyhow::Result<usize> {
+    failures: &mut Failures,
+) -> anyhow::Result<()> {
     let homeserver_url = &config.homeserver_url;
-    let mut failures = 0;
     let mut room_states = Vec::new();
     for room in joined_rooms(http_client, homeserver_url).await? {
         match room_state(http_client, homeserver_url, &room).await {
             Ok(room_state) => room_states.push((room, room_state)),
             Err(err) => {
                 warn!("Failed to get the state of {room}: {err:#}");
-                failures += 1;
+                failures.add("getting the state of rooms");
             }
         }
     }
@@ -1238,7 +1257,7 @@ async fn fix_outdated_references(
                     ),
                     Err(err) => {
                         warn!("Failed to check whether aliases still point to {room}: {err:#}");
-                        failures += 1;
+                        failures.add("checking for aliases of upgraded rooms");
                     }
                 }
             }
@@ -1268,7 +1287,7 @@ async fn fix_outdated_references(
                 warn!("Not locking down {room}, as we have power level {level} but need {needed}");
             } else if let Err(err) = restrict_old_room(http_client, homeserver_url, room).await {
                 warn!("Failed to lock down {room}: {err:#}");
-                failures += 1;
+                failures.add("locking down rooms");
             }
             continue;
         }
@@ -1316,12 +1335,12 @@ async fn fix_outdated_references(
                 Ok(()) => info!("Done: {description}"),
                 Err(err) => {
                     warn!("Failed: {description}: {err:#}");
-                    failures += 1;
+                    failures.add("updating references to upgraded rooms");
                 }
             }
         }
     }
-    Ok(failures)
+    Ok(())
 }
 
 /// Describes what still leads people to `room` through aliases or the room directory, which only
