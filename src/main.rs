@@ -137,17 +137,7 @@ async fn create_replacement_room(
 
     // The creators of the old room lose their unlimited power in the new one, so they get as much
     // power as anyone else has instead, but at least 100, unless they are dropped.
-    let room_state = send(http_client.get(url(
-        &config.homeserver_url,
-        CLIENT_API,
-        &["rooms", room, "state"],
-    )?))
-    .await?
-    .json::<Value>()
-    .await?;
-    let room_state = room_state
-        .as_array()
-        .context("room state is not an array")?;
+    let room_state = room_state(http_client, &config.homeserver_url, room).await?;
     let create = room_state
         .iter()
         .find(|event| event["type"] == "m.room.create" && event["state_key"] == "")
@@ -307,80 +297,31 @@ async fn prepare_room(
     self_user_id: &str,
     room: &str,
 ) -> anyhow::Result<Steps> {
-    // The admin API also works for rooms we aren't in yet, but only server admins can use it and
-    // reverse proxies often don't expose it.
-    let res =
-        send_retrying(http_client.get(url(homeserver_url, ADMIN_API, &["rooms", room, "state"])?))
-            .await?;
-    let admin_api = !matches!(res.status(), StatusCode::FORBIDDEN | StatusCode::NOT_FOUND);
-    let room_state = if admin_api {
-        error_for_status(res).await?.json::<Value>().await?["state"].take()
-    } else {
-        join(http_client, homeserver_url, room).await?;
-        send(http_client.get(url(homeserver_url, CLIENT_API, &["rooms", room, "state"])?))
-            .await?
-            .json::<Value>()
-            .await?
-    };
-    let room_state = room_state
-        .as_array()
-        .context("room state is not an array")?;
-    let find = |event_type: &str, state_key: &str| {
-        room_state
-            .iter()
-            .find(|event| event["type"] == event_type && event["state_key"] == state_key)
-    };
-
-    let creators = creators(find("m.room.create", "").context("room has no create event")?);
-    let power_levels = match find("m.room.power_levels", "") {
-        Some(power_levels) if !creators.contains(&self_user_id) => power_levels,
-        _ => {
+    let (admin_api, room_state) = match admin_room_state(http_client, homeserver_url, room).await? {
+        Some(room_state) => (true, room_state),
+        None => {
             join(http_client, homeserver_url, room).await?;
-            return Ok(Steps {
-                lock_down: true,
-                move_aliases: true,
-            });
+            (false, room_state(http_client, homeserver_url, room).await?)
         }
     };
-    let power_levels = power_levels["content"]
-        .as_object()
-        .context("PL state is not an object")?;
-    let empty = serde_json::Map::new();
-    let map = |key: &str| match power_levels.get(key) {
-        Some(map) => map
-            .as_object()
-            .with_context(|| format!("PL state key {key} is not an object")),
-        None => Ok(&empty),
-    };
-    let (events, users) = (map("events")?, map("users")?);
-    let state_default = power_level(power_levels, "state_default", int!(50))?;
-    let events_default = power_level(power_levels, "events_default", int!(0))?;
-    let users_default = power_level(power_levels, "users_default", int!(0))?;
+    let power = Power::new(&room_state)?;
 
     // The power needed for each step, counting only changes that are still to be made.
-    let upgrade = if find("m.room.tombstone", "").is_some() {
+    let upgrade = if power.find("m.room.tombstone", "").is_some() {
         int!(0)
     } else {
-        power_level(events, "m.room.tombstone", state_default)?.max(power_level(
-            events,
-            "m.room.message",
-            events_default,
-        )?)
+        power
+            .state_event("m.room.tombstone")?
+            .max(power.event("m.room.message")?)
     };
-    let mut lock_down = int!(0);
-    let restricted = int!(50).max(users_default.saturating_add(int!(1)));
-    if events_default < restricted || power_level(power_levels, "invite", int!(0))? < restricted {
-        lock_down = restricted.max(power_level(events, "m.room.power_levels", state_default)?);
-    }
-    if find("m.room.join_rules", "").is_some_and(|event| event["content"]["join_rule"] != "invite")
-    {
-        lock_down = lock_down.max(power_level(events, "m.room.join_rules", state_default)?);
-    }
-    let mut has_aliases = find("m.room.canonical_alias", "").is_some_and(|event| {
-        event["content"]
-            .as_object()
-            .is_some_and(|content| !content.is_empty())
-    });
+    let lock_down = power.lock_down()?;
+    let mut has_aliases = power
+        .find("m.room.canonical_alias", "")
+        .is_some_and(|event| {
+            event["content"]
+                .as_object()
+                .is_some_and(|content| !content.is_empty())
+        });
     // Deleting aliases we didn't create and changing the room directory need the power to change
     // the canonical alias too, unless we're a server admin.
     if !has_aliases && !admin_api {
@@ -390,63 +331,34 @@ async fn prepare_room(
             || is_published(http_client, homeserver_url, room).await?;
     }
     let move_aliases = if has_aliases {
-        power_level(events, "m.room.canonical_alias", state_default)?
+        power.state_event("m.room.canonical_alias")?
     } else {
         int!(0)
     };
 
-    let mut level = power_level(users, self_user_id, users_default)?;
+    let mut level = power.user(self_user_id)?;
     let needed = [
         ("upgrade it", upgrade),
         ("lock it down", lock_down),
         ("move its aliases", move_aliases),
     ];
     if admin_api && needed.iter().any(|(_, required)| level < *required) {
-        // Mirrors how make_room_admin picks the user to act as: local creators first, then the
-        // local user with the most power, as long as they're joined. We get the level of that
-        // user, or 100 for creators. Among users with the same level it may pick another one.
-        let own_server = server_name(self_user_id)?;
-        let mut candidates = users
+        let needed = needed
             .iter()
-            .map(|(user, level)| Ok((user.as_str(), parse_power_level(user, level)?)))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        candidates.sort_by_key(|(_, level)| std::cmp::Reverse(*level));
-        let candidate = creators
-            .iter()
-            .map(|creator| Ok((*creator, power_level(users, creator, int!(100))?)))
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .into_iter()
-            .chain(candidates)
-            .find(|(user, _)| {
-                server_name(user).is_ok_and(|server| server == own_server)
-                    && find("m.room.member", user)
-                        .is_some_and(|event| event["content"]["membership"] == "join")
-            });
-        if let Some((admin_user, granted)) = candidate.filter(|(_, granted)| *granted > level) {
-            let needed = needed
-                .iter()
-                .filter(|(_, required)| *required > int!(0))
-                .map(|(step, required)| format!("{required} to {step}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            if confirm(format!(
-                "We have power level {level} in {room}, but need {needed}. Get power level \
-                 {granted} through make_room_admin, acting as {admin_user}?"
-            ))? {
-                send(
-                    http_client
-                        .post(url(
-                            homeserver_url,
-                            ADMIN_API,
-                            &["rooms", room, "make_room_admin"],
-                        )?)
-                        .json(&json!({})),
-                )
-                .await?;
-                info!("Got power level {granted} in {room} through {admin_user}");
-                level = granted;
-            }
-        }
+            .filter(|(_, required)| *required > int!(0))
+            .map(|(step, required)| format!("{required} to {step}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        level = offer_make_room_admin(
+            http_client,
+            homeserver_url,
+            self_user_id,
+            room,
+            &power,
+            level,
+            &needed,
+        )
+        .await?;
     }
 
     anyhow::ensure!(
@@ -472,6 +384,215 @@ async fn prepare_room(
     };
     join(http_client, homeserver_url, room).await?;
     Ok(steps)
+}
+
+/// Fetches the state of `room` through the admin API, which also works for rooms we aren't in, or
+/// returns `None` if we can't use the admin API. Only server admins can use it, and reverse
+/// proxies often don't expose it.
+async fn admin_room_state(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    room: &str,
+) -> anyhow::Result<Option<Vec<Value>>> {
+    let res =
+        send_retrying(http_client.get(url(homeserver_url, ADMIN_API, &["rooms", room, "state"])?))
+            .await?;
+    if matches!(res.status(), StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) {
+        return Ok(None);
+    }
+    let mut body = error_for_status(res).await?.json::<Value>().await?;
+    Ok(Some(serde_json::from_value(body["state"].take())?))
+}
+
+/// Fetches the state of `room`, which we need to be in.
+async fn room_state(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    room: &str,
+) -> anyhow::Result<Vec<Value>> {
+    Ok(
+        send(http_client.get(url(homeserver_url, CLIENT_API, &["rooms", room, "state"])?))
+            .await?
+            .json()
+            .await?,
+    )
+}
+
+/// Who has how much power in a room, and how much power doing things there needs, going by the
+/// room's state.
+struct Power<'a> {
+    room_state: &'a [Value],
+    creators: Vec<&'a str>,
+    /// The content of the room's power levels, without which everyone may do anything.
+    power_levels: Option<&'a serde_json::Map<String, Value>>,
+}
+
+impl<'a> Power<'a> {
+    fn new(room_state: &'a [Value]) -> anyhow::Result<Self> {
+        let find = |event_type: &str| {
+            room_state
+                .iter()
+                .find(|event| event["type"] == event_type && event["state_key"] == "")
+        };
+        let power_levels = find("m.room.power_levels")
+            .map(|event| {
+                event["content"]
+                    .as_object()
+                    .context("PL state is not an object")
+            })
+            .transpose()?;
+        Ok(Self {
+            room_state,
+            creators: creators(find("m.room.create").context("room has no create event")?),
+            power_levels,
+        })
+    }
+
+    /// Finds the state event of `event_type` with `state_key`.
+    fn find(&self, event_type: &str, state_key: &str) -> Option<&'a Value> {
+        self.room_state
+            .iter()
+            .find(|event| event["type"] == event_type && event["state_key"] == state_key)
+    }
+
+    /// Reads the power level stored under `key`, falling back to `default` if it's missing.
+    fn level(&self, key: &str, default: Int) -> anyhow::Result<Int> {
+        match self.power_levels {
+            Some(power_levels) => power_level(power_levels, key, default),
+            None => Ok(int!(0)),
+        }
+    }
+
+    /// Reads the power level stored under `key` in the map of power levels stored under `map`,
+    /// falling back to `default` if it's missing.
+    fn map_level(&self, map: &str, key: &str, default: Int) -> anyhow::Result<Int> {
+        match self.map(map)?.and_then(|map| map.get(key)) {
+            Some(level) => parse_power_level(key, level),
+            None => Ok(default),
+        }
+    }
+
+    /// The map of power levels stored under `key`.
+    fn map(&self, key: &str) -> anyhow::Result<Option<&'a serde_json::Map<String, Value>>> {
+        self.power_levels
+            .and_then(|power_levels| power_levels.get(key))
+            .map(|map| {
+                map.as_object()
+                    .with_context(|| format!("PL state key {key} is not an object"))
+            })
+            .transpose()
+    }
+
+    /// The power level of `user`.
+    fn user(&self, user: &str) -> anyhow::Result<Int> {
+        if self.creators.contains(&user) {
+            return Ok(Int::MAX);
+        }
+        self.map_level("users", user, self.level("users_default", int!(0))?)
+    }
+
+    /// The power level needed to send state events of `event_type`.
+    fn state_event(&self, event_type: &str) -> anyhow::Result<Int> {
+        self.map_level("events", event_type, self.level("state_default", int!(50))?)
+    }
+
+    /// The power level needed to send events of `event_type` that aren't state events.
+    fn event(&self, event_type: &str) -> anyhow::Result<Int> {
+        self.map_level("events", event_type, self.level("events_default", int!(0))?)
+    }
+
+    /// The power level needed to lock the room down like `restrict_old_room` does, or 0 if it's
+    /// locked down already.
+    fn lock_down(&self) -> anyhow::Result<Int> {
+        let mut needed = int!(0);
+        let restricted = int!(50).max(
+            self.level("users_default", int!(0))?
+                .saturating_add(int!(1)),
+        );
+        if self.level("events_default", int!(0))? < restricted
+            || self.level("invite", int!(0))? < restricted
+        {
+            needed = restricted.max(self.state_event("m.room.power_levels")?);
+        }
+        if self
+            .find("m.room.join_rules", "")
+            .is_some_and(|event| event["content"]["join_rule"] != "invite")
+        {
+            needed = needed.max(self.state_event("m.room.join_rules")?);
+        }
+        Ok(needed)
+    }
+
+    /// The user make_room_admin would act as when we use it, and the power level we would get.
+    ///
+    /// Mirrors how make_room_admin picks the user: local creators first, then the local user with
+    /// the most power, as long as they're joined. We get the level of that user, or 100 for
+    /// creators. Among users with the same level it may pick another one.
+    fn make_room_admin_candidate(
+        &self,
+        self_user_id: &str,
+    ) -> anyhow::Result<Option<(String, Int)>> {
+        let own_server = server_name(self_user_id)?;
+        let mut candidates = self
+            .map("users")?
+            .into_iter()
+            .flatten()
+            .map(|(user, level)| Ok((user.as_str(), parse_power_level(user, level)?)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        candidates.sort_by_key(|(_, level)| std::cmp::Reverse(*level));
+        Ok(self
+            .creators
+            .iter()
+            .map(|creator| Ok((*creator, self.map_level("users", creator, int!(100))?)))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .chain(candidates)
+            .find(|(user, _)| {
+                server_name(user).is_ok_and(|server| server == own_server)
+                    && self
+                        .find("m.room.member", user)
+                        .is_some_and(|event| event["content"]["membership"] == "join")
+            })
+            .map(|(user, level)| (user.to_string(), level)))
+    }
+}
+
+/// Offers to take over the power of another user in `room` through Synapse's make_room_admin
+/// admin API, if that gets us more than `level`, which is too little to do what `needed`
+/// describes. Returns the power level we have afterwards.
+async fn offer_make_room_admin(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    self_user_id: &str,
+    room: &str,
+    power: &Power<'_>,
+    level: Int,
+    needed: &str,
+) -> anyhow::Result<Int> {
+    let Some((admin_user, granted)) = power
+        .make_room_admin_candidate(self_user_id)?
+        .filter(|(_, granted)| *granted > level)
+    else {
+        return Ok(level);
+    };
+    if !confirm(format!(
+        "We have power level {level} in {room}, but need {needed}. Get power level {granted} \
+         through make_room_admin, acting as {admin_user}?"
+    ))? {
+        return Ok(level);
+    }
+    send(
+        http_client
+            .post(url(
+                homeserver_url,
+                ADMIN_API,
+                &["rooms", room, "make_room_admin"],
+            )?)
+            .json(&json!({})),
+    )
+    .await?;
+    info!("Got power level {granted} in {room} through {admin_user}");
+    Ok(granted)
 }
 
 /// Joins `room` unless we're in it already.
