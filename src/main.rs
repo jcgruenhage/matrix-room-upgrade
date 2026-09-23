@@ -1144,7 +1144,8 @@ async fn restrict_old_room(
 /// an interrupted run can be resumed: aliases on our server are made to point to the new room
 /// whether they still point to the old one or were already deleted from it, which `state`
 /// remembers for aliases that aren't in the canonical alias. Aliases on other servers can't be
-/// moved and are dropped from the canonical alias unless they already point to the new room.
+/// moved and are dropped from the canonical alias unless they already point to the new room. The
+/// canonical alias of the new room only gains the aliases that moved, so nothing is removed there.
 async fn move_aliases(
     http_client: &reqwest::Client,
     homeserver_url: &str,
@@ -1217,39 +1218,68 @@ async fn move_aliases(
         }
     }
 
-    if let Some(mut canonical_alias) = canonical_alias {
-        let mut moved = HashSet::new();
+    if let Some(canonical_alias) = canonical_alias {
+        let mut moved = Vec::new();
         for alias in canonical_alias_entries(&canonical_alias) {
             if resolve_alias(http_client, homeserver_url, alias)
                 .await?
                 .as_deref()
                 == Some(new_room_id)
             {
-                moved.insert(alias.to_string());
+                moved.push(alias);
             }
         }
-        let map = canonical_alias
-            .as_object_mut()
-            .context("canonical alias is not an object")?;
-        if map
-            .get("alias")
-            .and_then(Value::as_str)
-            .is_some_and(|alias| !moved.contains(alias))
-        {
-            map.remove("alias");
-        }
-        if let Some(alt_aliases) = map.get_mut("alt_aliases").and_then(Value::as_array_mut) {
-            alt_aliases.retain(|alias| alias.as_str().is_some_and(|alias| moved.contains(alias)));
-        }
-        put_state(
+        // The moved aliases are added to the canonical alias of the new room, keeping what was
+        // set there since, like by hand after an interrupted run.
+        let mut new_canonical_alias = get_state(
             http_client,
             homeserver_url,
             new_room_id,
             "m.room.canonical_alias",
             "",
-            &canonical_alias,
         )
-        .await?;
+        .await?
+        .unwrap_or_else(|| json!({}));
+        let unchanged = new_canonical_alias.clone();
+        let map = new_canonical_alias
+            .as_object_mut()
+            .context("canonical alias is not an object")?;
+        if map.get("alias").and_then(Value::as_str).is_none() {
+            if let Some(alias) = canonical_alias["alias"]
+                .as_str()
+                .filter(|alias| moved.contains(alias))
+            {
+                map.insert("alias".to_string(), json!(alias));
+            }
+        }
+        let main_alias = map.get("alias").and_then(Value::as_str).map(str::to_string);
+        for alias in moved {
+            if main_alias.as_deref() == Some(alias) {
+                continue;
+            }
+            let alt_aliases = map
+                .entry("alt_aliases")
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .context("alt_aliases is not an array")?;
+            if !alt_aliases
+                .iter()
+                .any(|other| other.as_str() == Some(alias))
+            {
+                alt_aliases.push(json!(alias));
+            }
+        }
+        if new_canonical_alias != unchanged {
+            put_state(
+                http_client,
+                homeserver_url,
+                new_room_id,
+                "m.room.canonical_alias",
+                "",
+                &new_canonical_alias,
+            )
+            .await?;
+        }
         put_state(
             http_client,
             homeserver_url,
