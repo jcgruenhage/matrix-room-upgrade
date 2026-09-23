@@ -539,15 +539,17 @@ fn describe_upgrade(
         let Some(user_id) = event["state_key"].as_str() else {
             continue;
         };
-        if event["type"] != "m.room.member"
-            || user_id == self_user_id
-            || config.drop_members.iter().any(|dropped| dropped == user_id)
-        {
+        if event["type"] != "m.room.member" {
             continue;
         }
         match event["content"]["membership"].as_str() {
-            Some("join" | "invite") => invites += 1,
-            Some("ban") => bans += 1,
+            Some("join" | "invite")
+                if user_id != self_user_id
+                    && !config.drop_members.iter().any(|dropped| dropped == user_id) =>
+            {
+                invites += 1
+            }
+            Some("ban") if config.transfers_ban(event) => bans += 1,
             _ => {}
         }
     }
@@ -937,7 +939,7 @@ async fn upgrade_room(
         );
         match membership {
             "join" | "invite" => joined_members.push(entry),
-            "ban" => banned_members.push(entry),
+            "ban" if config.transfers_ban(member) => banned_members.push(entry),
             _ => {}
         }
     }

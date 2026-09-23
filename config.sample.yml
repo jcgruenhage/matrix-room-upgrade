@@ -16,3 +16,8 @@ state_events_to_transfer:
   - "m.room.topic"
 drop_members:
   - '<user_id>'
+# Whether to ban users banned in the old room in the new one too, defaults to true.
+transfer_bans: true
+# Users whose bans aren't transferred, like moderation bots that ban users themselves.
+skip_bans_by:
+  - '<user_id>'
