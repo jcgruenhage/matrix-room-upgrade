@@ -100,14 +100,7 @@ async fn create_replacement_room(
     let map = power_levels
         .as_object_mut()
         .context("PL state is not an object")?;
-    let users_default = match map.get("users_default") {
-        Some(num) => num
-            .as_number()
-            .context("PL state key users_default is not a number")?
-            .as_u64()
-            .context("PL state key users_default is not a u64")?,
-        None => 0,
-    };
+    let users_default = power_level(map, "users_default")?;
     let users = map
         .get_mut("users")
         .context("PL state does not contain users key")?
@@ -272,23 +265,21 @@ async fn upgrade_room(
             new_room_id
         };
 
-        send(
-            http_client
-                .put(format!(
-                    "{}/_matrix/client/v3/rooms/{room}/state/m.room.tombstone/",
-                    config.homeserver_url
-                ))
-                .json(&json!({
-                    "body": "This room has been replaced",
-                    "replacement_room": new_room_id,
-                })),
+        put_state(
+            http_client,
+            &config.homeserver_url,
+            room,
+            "m.room.tombstone",
+            &json!({
+                "body": "This room has been replaced",
+                "replacement_room": new_room_id,
+            }),
         )
-        .await?
-        .json::<Value>()
         .await?;
         info!("Tombstoned {room}");
         new_room_id
     };
+    restrict_old_room(http_client, &config.homeserver_url, room).await?;
 
     let new_members_res = send(http_client.get(format!(
         "{}/_matrix/client/v3/rooms/{new_room_id}/members",
@@ -360,6 +351,86 @@ async fn upgrade_room(
         failures == 0,
         "{failures} bans/invites in {new_room_id} failed, re-run to retry them"
     );
+    Ok(())
+}
+
+/// Stops the old room from being used any further, like a server side upgrade does: raises the
+/// power levels needed to send events and to invite to max(50, users_default + 1), and makes the
+/// room invite only.
+async fn restrict_old_room(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    room: &str,
+) -> anyhow::Result<()> {
+    let mut power_levels = get_state(http_client, homeserver_url, room, "m.room.power_levels")
+        .await?
+        .context("room has no power levels")?;
+    let map = power_levels
+        .as_object_mut()
+        .context("PL state is not an object")?;
+    let restricted = 50.max(power_level(map, "users_default")? + 1);
+    let mut changed = false;
+    for key in ["events_default", "invite"] {
+        if power_level(map, key)? < restricted {
+            map.insert(key.to_string(), json!(restricted));
+            changed = true;
+        }
+    }
+    if changed {
+        put_state(
+            http_client,
+            homeserver_url,
+            room,
+            "m.room.power_levels",
+            &power_levels,
+        )
+        .await?;
+        info!("Raised the power level to send events and invite in {room} to {restricted}");
+    }
+
+    // A room without join rules is invite only already.
+    let join_rules = get_state(http_client, homeserver_url, room, "m.room.join_rules").await?;
+    if join_rules.is_some_and(|content| content["join_rule"] != "invite") {
+        put_state(
+            http_client,
+            homeserver_url,
+            room,
+            "m.room.join_rules",
+            &json!({ "join_rule": "invite" }),
+        )
+        .await?;
+        info!("Made {room} invite only");
+    }
+    Ok(())
+}
+
+/// Reads a power level from the content of an `m.room.power_levels` event, where missing
+/// levels default to 0.
+fn power_level(power_levels: &serde_json::Map<String, Value>, key: &str) -> anyhow::Result<u64> {
+    match power_levels.get(key) {
+        Some(level) => level
+            .as_u64()
+            .with_context(|| format!("PL state key {key} is not a u64")),
+        None => Ok(0),
+    }
+}
+
+/// Sends a state event with an empty state key.
+async fn put_state(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    room: &str,
+    event_type: &str,
+    content: &Value,
+) -> anyhow::Result<()> {
+    send(
+        http_client
+            .put(format!(
+                "{homeserver_url}/_matrix/client/v3/rooms/{room}/state/{event_type}/"
+            ))
+            .json(content),
+    )
+    .await?;
     Ok(())
 }
 
