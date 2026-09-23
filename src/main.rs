@@ -277,11 +277,10 @@ async fn main() -> anyhow::Result<()> {
         }
 
         for (user_id, reason) in joined_members.iter() {
-            if dbg!(config.drop_members.contains(dbg!(user_id))) {
-                continue;
-            } else if &self_user_id == user_id {
-                continue;
-            } else if new_members.contains(user_id.as_str()) {
+            if dbg!(config.drop_members.contains(dbg!(user_id)))
+                || &self_user_id == user_id
+                || new_members.contains(user_id.as_str())
+            {
                 continue;
             }
             dbg!(
