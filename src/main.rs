@@ -451,13 +451,8 @@ async fn join(
     homeserver_url: &str,
     room: &str,
 ) -> anyhow::Result<()> {
-    let joined_rooms = send(http_client.get(url(homeserver_url, CLIENT_API, &["joined_rooms"])?))
+    if !joined_rooms(http_client, homeserver_url)
         .await?
-        .json::<Value>()
-        .await?;
-    if !joined_rooms["joined_rooms"]
-        .as_array()
-        .context("joined_rooms response has no joined_rooms")?
         .iter()
         .any(|joined_room| joined_room == room)
     {
@@ -470,6 +465,24 @@ async fn join(
         info!("Joined {room}");
     }
     Ok(())
+}
+
+/// Lists the rooms we're in.
+async fn joined_rooms(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+) -> anyhow::Result<Vec<String>> {
+    let res = send(http_client.get(url(homeserver_url, CLIENT_API, &["joined_rooms"])?))
+        .await?
+        .json::<Value>()
+        .await?;
+    Ok(res["joined_rooms"]
+        .as_array()
+        .context("joined_rooms response has no joined_rooms")?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect())
 }
 
 /// Asks the user a yes/no question, defaulting to no.
@@ -610,6 +623,8 @@ async fn upgrade_room(
         failures += 1;
     }
     failures += move_space_parents(http_client, &config.homeserver_url, room, &new_room_id).await?;
+    failures +=
+        move_join_rule_references(http_client, &config.homeserver_url, room, &new_room_id).await?;
 
     let new_members_res = send(http_client.get(url(
         &config.homeserver_url,
@@ -877,6 +892,72 @@ async fn move_aliases(
             info!("Replaced {room} with {new_room_id} in the room directory");
         }
     }
+    Ok(())
+}
+
+/// Lets members of `new_room_id` join the rooms we're in whose restricted join rules let members
+/// of `room` join. Members of `room` stay allowed, as not all of them will have moved yet. Returns
+/// how many rooms couldn't be updated, e.g. because we lack the power level to change them.
+async fn move_join_rule_references(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    room: &str,
+    new_room_id: &str,
+) -> anyhow::Result<usize> {
+    let mut failures = 0;
+    for other_room in joined_rooms(http_client, homeserver_url).await? {
+        if let Err(err) =
+            move_join_rule_reference(http_client, homeserver_url, room, new_room_id, &other_room)
+                .await
+        {
+            warn!("Failed to allow members of {new_room_id} to join {other_room}: {err:#}");
+            failures += 1;
+        }
+    }
+    Ok(failures)
+}
+
+/// Lets members of `new_room_id` join `other_room` if its join rules let members of `room` join.
+async fn move_join_rule_reference(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    room: &str,
+    new_room_id: &str,
+    other_room: &str,
+) -> anyhow::Result<()> {
+    let Some(mut join_rules) = get_state(
+        http_client,
+        homeserver_url,
+        other_room,
+        "m.room.join_rules",
+        "",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let Some(allow) = join_rules["allow"].as_array_mut() else {
+        return Ok(());
+    };
+    let allows = |room_id: &str| {
+        allow.iter().any(|condition| {
+            condition["type"] == "m.room_membership" && condition["room_id"] == room_id
+        })
+    };
+    if !allows(room) || allows(new_room_id) {
+        return Ok(());
+    }
+    allow.push(json!({ "type": "m.room_membership", "room_id": new_room_id }));
+    put_state(
+        http_client,
+        homeserver_url,
+        other_room,
+        "m.room.join_rules",
+        "",
+        &join_rules,
+    )
+    .await?;
+    info!("Allowed members of {new_room_id} to join {other_room}");
     Ok(())
 }
 
