@@ -145,9 +145,10 @@ async fn create_replacement_room(
     .await?
     .json::<Value>()
     .await?;
-    let create = room_state
+    let room_state = room_state
         .as_array()
-        .context("room state is not an array")?
+        .context("room state is not an array")?;
+    let create = room_state
         .iter()
         .find(|event| event["type"] == "m.room.create" && event["state_key"] == "")
         .context("room has no create event")?;
@@ -191,6 +192,19 @@ async fn create_replacement_room(
             }));
         }
     }
+    // Spaces keep their children.
+    initial_state.extend(
+        room_state
+            .iter()
+            .filter(|event| event["type"] == "m.space.child" && has_via(&event["content"]))
+            .map(|event| {
+                json!({
+                    "content": event["content"],
+                    "state_key": event["state_key"],
+                    "type": "m.space.child",
+                })
+            }),
+    );
     // Without a preset, createRoom uses private_chat, which lets guests join. Rooms without guest
     // access don't, so we keep that unless the old room's guest access is transferred.
     if !initial_state
