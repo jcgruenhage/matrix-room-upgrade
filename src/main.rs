@@ -13,6 +13,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
+const CLIENT_API: &str = "_matrix/client/v3";
+const ADMIN_API: &str = "_synapse/admin/v1";
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -56,10 +58,11 @@ async fn main() -> anyhow::Result<()> {
         .default_headers(headers)
         .build()?;
 
-    let self_user_id_res = send(http_client.get(format!(
-        "{}/_matrix/client/v3/account/whoami",
-        config.homeserver_url
-    )))
+    let self_user_id_res = send(http_client.get(url(
+        &config.homeserver_url,
+        CLIENT_API,
+        &["account", "whoami"],
+    )?))
     .await?
     .json::<Value>()
     .await?;
@@ -132,10 +135,11 @@ async fn create_replacement_room(
 
     // The creators of the old room lose their unlimited power in the new one, so they get as much
     // power as anyone else has instead, but at least 100, unless they are dropped.
-    let room_state = send(http_client.get(format!(
-        "{}/_matrix/client/v3/rooms/{room}/state",
-        config.homeserver_url
-    )))
+    let room_state = send(http_client.get(url(
+        &config.homeserver_url,
+        CLIENT_API,
+        &["rooms", room, "state"],
+    )?))
     .await?
     .json::<Value>()
     .await?;
@@ -201,10 +205,11 @@ async fn create_replacement_room(
     let txn_id = Uuid::new_v4();
     let res = send(
         http_client
-            .put(format!(
-                "{}/_matrix/client/v3/rooms/{room}/send/m.room.message/{txn_id}",
-                config.homeserver_url
-            ))
+            .put(url(
+                &config.homeserver_url,
+                CLIENT_API,
+                &["rooms", room, "send", "m.room.message", &txn_id.to_string()],
+            )?)
             .json(&json!({
                 "body": "Upgrading room, please stand by",
                 "msgtype": "m.text"
@@ -223,10 +228,7 @@ async fn create_replacement_room(
 
     let new_room_body = send(
         http_client
-            .post(format!(
-                "{}/_matrix/client/v3/createRoom",
-                config.homeserver_url
-            ))
+            .post(url(&config.homeserver_url, CLIENT_API, &["createRoom"])?)
             .json(&json!({
                 "creation_content": {
                     "predecessor": {
@@ -267,21 +269,18 @@ async fn prepare_room(
 ) -> anyhow::Result<Steps> {
     // The admin API also works for rooms we aren't in yet, but only server admins can use it and
     // reverse proxies often don't expose it.
-    let res = send_retrying(http_client.get(format!(
-        "{homeserver_url}/_synapse/admin/v1/rooms/{room}/state"
-    )))
-    .await?;
+    let res =
+        send_retrying(http_client.get(url(homeserver_url, ADMIN_API, &["rooms", room, "state"])?))
+            .await?;
     let admin_api = !matches!(res.status(), StatusCode::FORBIDDEN | StatusCode::NOT_FOUND);
     let room_state = if admin_api {
         error_for_status(res).await?.json::<Value>().await?["state"].take()
     } else {
         join(http_client, homeserver_url, room).await?;
-        send(http_client.get(format!(
-            "{homeserver_url}/_matrix/client/v3/rooms/{room}/state"
-        )))
-        .await?
-        .json::<Value>()
-        .await?
+        send(http_client.get(url(homeserver_url, CLIENT_API, &["rooms", room, "state"])?))
+            .await?
+            .json::<Value>()
+            .await?
     };
     let room_state = room_state
         .as_array()
@@ -396,9 +395,11 @@ async fn prepare_room(
             ))? {
                 send(
                     http_client
-                        .post(format!(
-                            "{homeserver_url}/_synapse/admin/v1/rooms/{room}/make_room_admin"
-                        ))
+                        .post(url(
+                            homeserver_url,
+                            ADMIN_API,
+                            &["rooms", room, "make_room_admin"],
+                        )?)
                         .json(&json!({})),
                 )
                 .await?;
@@ -439,11 +440,10 @@ async fn join(
     homeserver_url: &str,
     room: &str,
 ) -> anyhow::Result<()> {
-    let joined_rooms =
-        send(http_client.get(format!("{homeserver_url}/_matrix/client/v3/joined_rooms")))
-            .await?
-            .json::<Value>()
-            .await?;
+    let joined_rooms = send(http_client.get(url(homeserver_url, CLIENT_API, &["joined_rooms"])?))
+        .await?
+        .json::<Value>()
+        .await?;
     if !joined_rooms["joined_rooms"]
         .as_array()
         .context("joined_rooms response has no joined_rooms")?
@@ -452,9 +452,7 @@ async fn join(
     {
         send(
             http_client
-                .post(format!(
-                    "{homeserver_url}/_matrix/client/v3/rooms/{room}/join"
-                ))
+                .post(url(homeserver_url, CLIENT_API, &["rooms", room, "join"])?)
                 .json(&json!({})),
         )
         .await?;
@@ -501,10 +499,11 @@ async fn upgrade_room(
         None
     };
 
-    let old_members_res = send(http_client.get(format!(
-        "{}/_matrix/client/v3/rooms/{room}/members",
-        config.homeserver_url
-    )))
+    let old_members_res = send(http_client.get(url(
+        &config.homeserver_url,
+        CLIENT_API,
+        &["rooms", room, "members"],
+    )?))
     .await?
     .json::<Value>()
     .await?;
@@ -599,10 +598,11 @@ async fn upgrade_room(
     }
     failures += move_space_parents(http_client, &config.homeserver_url, room, &new_room_id).await?;
 
-    let new_members_res = send(http_client.get(format!(
-        "{}/_matrix/client/v3/rooms/{new_room_id}/members",
-        config.homeserver_url
-    )))
+    let new_members_res = send(http_client.get(url(
+        &config.homeserver_url,
+        CLIENT_API,
+        &["rooms", &new_room_id, "members"],
+    )?))
     .await?
     .json::<Value>()
     .await?;
@@ -620,10 +620,11 @@ async fn upgrade_room(
         }
         if let Err(err) = send(
             http_client
-                .post(format!(
-                    "{}/_matrix/client/v3/rooms/{new_room_id}/ban",
-                    config.homeserver_url
-                ))
+                .post(url(
+                    &config.homeserver_url,
+                    CLIENT_API,
+                    &["rooms", &new_room_id, "ban"],
+                )?)
                 .json(&json!({
                     "reason": reason,
                     "user_id": user_id,
@@ -647,10 +648,11 @@ async fn upgrade_room(
         }
         if let Err(err) = send(
             http_client
-                .post(format!(
-                    "{}/_matrix/client/v3/rooms/{new_room_id}/invite",
-                    config.homeserver_url
-                ))
+                .post(url(
+                    &config.homeserver_url,
+                    CLIENT_API,
+                    &["rooms", &new_room_id, "invite"],
+                )?)
                 .json(&json!({
                     "reason": reason,
                     "user_id": user_id,
@@ -762,11 +764,11 @@ async fn move_aliases(
     }
 
     for alias in &aliases {
-        let url = directory_url(homeserver_url, alias)?;
+        let alias_url = url(homeserver_url, CLIENT_API, &["directory", "room", alias])?;
         match resolve_alias(http_client, homeserver_url, alias).await? {
             Some(target) if target == new_room_id => continue,
             Some(target) if target == room => {
-                send(http_client.delete(url.clone())).await?;
+                send(http_client.delete(alias_url.clone())).await?;
             }
             Some(target) => {
                 warn!("{alias} points to {target} instead of {room}, leaving it alone");
@@ -776,7 +778,7 @@ async fn move_aliases(
         }
         send(
             http_client
-                .put(url)
+                .put(alias_url)
                 .json(&json!({ "room_id": new_room_id })),
         )
         .await?;
@@ -830,20 +832,22 @@ async fn move_aliases(
 
     if is_published(http_client, homeserver_url, room).await? {
         let set_visibility = |room: &str, visibility: &str| {
-            send(
+            anyhow::Ok(send(
                 http_client
-                    .put(format!(
-                        "{homeserver_url}/_matrix/client/v3/directory/list/room/{room}"
-                    ))
+                    .put(url(
+                        homeserver_url,
+                        CLIENT_API,
+                        &["directory", "list", "room", room],
+                    )?)
                     .json(&json!({ "visibility": visibility })),
-            )
+            ))
         };
         // Servers can restrict who may publish rooms, which won't change by retrying, so this
         // doesn't fail the upgrade. The old room stays published to not drop out of the directory.
-        if let Err(err) = set_visibility(new_room_id, "public").await {
+        if let Err(err) = set_visibility(new_room_id, "public")?.await {
             warn!("Failed to publish {new_room_id}, leaving {room} published instead: {err:#}");
         } else {
-            set_visibility(room, "private").await?;
+            set_visibility(room, "private")?.await?;
             info!("Replaced {room} with {new_room_id} in the room directory");
         }
     }
@@ -856,9 +860,11 @@ async fn local_aliases(
     homeserver_url: &str,
     room: &str,
 ) -> anyhow::Result<Vec<String>> {
-    let res = send(http_client.get(format!(
-        "{homeserver_url}/_matrix/client/v3/rooms/{room}/aliases"
-    )))
+    let res = send(http_client.get(url(
+        homeserver_url,
+        CLIENT_API,
+        &["rooms", room, "aliases"],
+    )?))
     .await?
     .json::<Value>()
     .await?;
@@ -877,9 +883,11 @@ async fn is_published(
     homeserver_url: &str,
     room: &str,
 ) -> anyhow::Result<bool> {
-    let res = send(http_client.get(format!(
-        "{homeserver_url}/_matrix/client/v3/directory/list/room/{room}"
-    )))
+    let res = send(http_client.get(url(
+        homeserver_url,
+        CLIENT_API,
+        &["directory", "list", "room", room],
+    )?))
     .await?
     .json::<Value>()
     .await?;
@@ -895,12 +903,10 @@ async fn move_space_parents(
     room: &str,
     new_room_id: &str,
 ) -> anyhow::Result<usize> {
-    let state = send(http_client.get(format!(
-        "{homeserver_url}/_matrix/client/v3/rooms/{room}/state"
-    )))
-    .await?
-    .json::<Value>()
-    .await?;
+    let state = send(http_client.get(url(homeserver_url, CLIENT_API, &["rooms", room, "state"])?))
+        .await?
+        .json::<Value>()
+        .await?;
     let mut failures = 0;
     for event in state.as_array().context("state response is not an array")? {
         if event["type"] != "m.space.parent" || !has_via(&event["content"]) {
@@ -1027,7 +1033,12 @@ async fn resolve_alias(
     homeserver_url: &str,
     alias: &str,
 ) -> anyhow::Result<Option<String>> {
-    let res = send_retrying(http_client.get(directory_url(homeserver_url, alias)?)).await?;
+    let res = send_retrying(http_client.get(url(
+        homeserver_url,
+        CLIENT_API,
+        &["directory", "room", alias],
+    )?))
+    .await?;
     if res.status() == StatusCode::NOT_FOUND {
         return Ok(None);
     }
@@ -1040,14 +1051,13 @@ async fn resolve_alias(
     ))
 }
 
-/// Builds the room directory URL for `alias`, escaping the `#` it starts with.
-fn directory_url(homeserver_url: &str, alias: &str) -> anyhow::Result<reqwest::Url> {
-    let mut url = reqwest::Url::parse(&format!(
-        "{homeserver_url}/_matrix/client/v3/directory/room"
-    ))?;
+/// Builds the URL of the endpoint at `path` in `api`, escaping each segment of `path`, like the
+/// `#` that aliases start with.
+fn url(homeserver_url: &str, api: &str, path: &[&str]) -> anyhow::Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&format!("{}/{api}", homeserver_url.trim_end_matches('/')))?;
     url.path_segments_mut()
         .map_err(|()| anyhow::anyhow!("{homeserver_url} is not a valid base URL"))?
-        .push(alias);
+        .extend(path);
     Ok(url)
 }
 
@@ -1108,9 +1118,11 @@ async fn put_state(
 ) -> anyhow::Result<()> {
     send(
         http_client
-            .put(format!(
-                "{homeserver_url}/_matrix/client/v3/rooms/{room}/state/{event_type}/{state_key}"
-            ))
+            .put(url(
+                homeserver_url,
+                CLIENT_API,
+                &["rooms", room, "state", event_type, state_key],
+            )?)
             .json(content),
     )
     .await?;
@@ -1125,9 +1137,11 @@ async fn get_state(
     event_type: &str,
     state_key: &str,
 ) -> anyhow::Result<Option<Value>> {
-    let res = send_retrying(http_client.get(format!(
-        "{homeserver_url}/_matrix/client/v3/rooms/{room}/state/{event_type}/{state_key}"
-    )))
+    let res = send_retrying(http_client.get(url(
+        homeserver_url,
+        CLIENT_API,
+        &["rooms", room, "state", event_type, state_key],
+    )?))
     .await?;
     if res.status() == StatusCode::NOT_FOUND {
         return Ok(None);
