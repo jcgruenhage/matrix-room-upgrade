@@ -192,16 +192,19 @@ async fn create_replacement_room(
             }));
         }
     }
-    // Spaces keep their children.
+    // Spaces keep their children, and rooms the spaces they name as their parents.
     initial_state.extend(
         room_state
             .iter()
-            .filter(|event| event["type"] == "m.space.child" && has_via(&event["content"]))
+            .filter(|event| {
+                (event["type"] == "m.space.child" || event["type"] == "m.space.parent")
+                    && has_via(&event["content"])
+            })
             .map(|event| {
                 json!({
                     "content": event["content"],
                     "state_key": event["state_key"],
-                    "type": "m.space.child",
+                    "type": event["type"],
                 })
             }),
     );
@@ -648,7 +651,6 @@ async fn upgrade_room(
         warn!("Failed to move the aliases of {room}: {err:#}");
         failures += 1;
     }
-    failures += move_space_parents(http_client, &config.homeserver_url, room, &new_room_id).await?;
     failures += move_references(http_client, &config.homeserver_url, room, &new_room_id).await?;
 
     let new_members_res = send(http_client.get(url(
@@ -944,6 +946,13 @@ async fn move_references(
             warn!("Failed to make {new_room_id} a parent of {other_room}: {err:#}");
             failures += 1;
         }
+        if let Err(err) =
+            move_space_child_reference(http_client, homeserver_url, room, new_room_id, &other_room)
+                .await
+        {
+            warn!("Failed to replace {room} with {new_room_id} in {other_room}: {err:#}");
+            failures += 1;
+        }
     }
     Ok(failures)
 }
@@ -1034,6 +1043,47 @@ async fn move_space_parent_reference(
     Ok(())
 }
 
+/// Replaces `room` with `new_room_id` as a child of `other_room`, if it is one.
+async fn move_space_child_reference(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    room: &str,
+    new_room_id: &str,
+    other_room: &str,
+) -> anyhow::Result<()> {
+    let Some(content) = get_state(
+        http_client,
+        homeserver_url,
+        other_room,
+        "m.space.child",
+        room,
+    )
+    .await?
+    .filter(has_via) else {
+        return Ok(());
+    };
+    put_state(
+        http_client,
+        homeserver_url,
+        other_room,
+        "m.space.child",
+        new_room_id,
+        &content,
+    )
+    .await?;
+    put_state(
+        http_client,
+        homeserver_url,
+        other_room,
+        "m.space.child",
+        room,
+        &json!({}),
+    )
+    .await?;
+    info!("Replaced {room} with {new_room_id} in {other_room}");
+    Ok(())
+}
+
 /// Lists the aliases our server has for `room`.
 async fn local_aliases(
     http_client: &reqwest::Client,
@@ -1072,102 +1122,6 @@ async fn is_published(
     .json::<Value>()
     .await?;
     Ok(res["visibility"] == "public")
-}
-
-/// Replaces `room` with `new_room_id` in the spaces that `room` names as its parents, and names
-/// those spaces as parents of the new room. Returns how many spaces couldn't be updated, e.g.
-/// because we lack the power level to change them.
-async fn move_space_parents(
-    http_client: &reqwest::Client,
-    homeserver_url: &str,
-    room: &str,
-    new_room_id: &str,
-) -> anyhow::Result<usize> {
-    let state = send(http_client.get(url(homeserver_url, CLIENT_API, &["rooms", room, "state"])?))
-        .await?
-        .json::<Value>()
-        .await?;
-    let mut failures = 0;
-    for event in state.as_array().context("state response is not an array")? {
-        if event["type"] != "m.space.parent" || !has_via(&event["content"]) {
-            continue;
-        }
-        let space = event["state_key"]
-            .as_str()
-            .context("space parent event has no state_key")?;
-        if let Err(err) = move_space_parent(
-            http_client,
-            homeserver_url,
-            room,
-            new_room_id,
-            space,
-            &event["content"],
-        )
-        .await
-        {
-            warn!("Failed to replace {room} with {new_room_id} in {space}: {err:#}");
-            failures += 1;
-        }
-    }
-    Ok(failures)
-}
-
-/// Names `space` as a parent of `new_room_id` and, if `space` still lists `room` as a child,
-/// replaces it with `new_room_id` there.
-async fn move_space_parent(
-    http_client: &reqwest::Client,
-    homeserver_url: &str,
-    room: &str,
-    new_room_id: &str,
-    space: &str,
-    parent_content: &Value,
-) -> anyhow::Result<()> {
-    let new_parent_content = get_state(
-        http_client,
-        homeserver_url,
-        new_room_id,
-        "m.space.parent",
-        space,
-    )
-    .await?;
-    if new_parent_content.as_ref() != Some(parent_content) {
-        put_state(
-            http_client,
-            homeserver_url,
-            new_room_id,
-            "m.space.parent",
-            space,
-            parent_content,
-        )
-        .await?;
-    }
-
-    let Some(child_content) = get_state(http_client, homeserver_url, space, "m.space.child", room)
-        .await?
-        .filter(has_via)
-    else {
-        return Ok(());
-    };
-    put_state(
-        http_client,
-        homeserver_url,
-        space,
-        "m.space.child",
-        new_room_id,
-        &child_content,
-    )
-    .await?;
-    put_state(
-        http_client,
-        homeserver_url,
-        space,
-        "m.space.child",
-        room,
-        &json!({}),
-    )
-    .await?;
-    info!("Replaced {room} with {new_room_id} in {space}");
-    Ok(())
 }
 
 /// Lists the users with unlimited power in a room, given its `m.room.create` event. From room
