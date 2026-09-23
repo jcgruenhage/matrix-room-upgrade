@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
+use log::{debug, error, info, warn, LevelFilter};
 use reqwest::{header, StatusCode};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -18,6 +19,15 @@ mod config;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
+    // LevelFilter::iter() runs from Off to Trace, so index 3 is the default of Info.
+    let log_level = LevelFilter::iter()
+        .nth((3 + usize::from(cli.verbose)).saturating_sub(usize::from(cli.quiet)))
+        .unwrap_or(LevelFilter::Trace);
+    env_logger::Builder::new()
+        .filter_level(log_level)
+        .parse_default_env()
+        .init();
+
     let config_file = File::open(&cli.config)
         .with_context(|| format!("failed to open {}", cli.config.display()))?;
     let config: config::Config = serde_yaml::from_reader(config_file)
@@ -54,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
     let mut failed_rooms = Vec::new();
     for room in &config.rooms {
         if let Err(err) = upgrade_room(&http_client, &config, &self_user_id, room).await {
-            eprintln!("Failed to upgrade {room}: {err:#}");
+            error!("Failed to upgrade {room}: {err:#}");
             failed_rooms.push(room);
         }
     }
@@ -71,6 +81,7 @@ async fn upgrade_room(
     self_user_id: &str,
     room: &str,
 ) -> anyhow::Result<()> {
+    info!("Upgrading {room}");
     let tombstone = get_state(
         http_client,
         &config.homeserver_url,
@@ -79,13 +90,12 @@ async fn upgrade_room(
     )
     .await?;
     let new_room_id = if let Some(tombstone_content) = tombstone {
-        println!("Room upgraded already, only transferring membership state");
-        Some(
-            tombstone_content["replacement_room"]
-                .as_str()
-                .context("tombstone has no replacement_room")?
-                .to_string(),
-        )
+        let new_room_id = tombstone_content["replacement_room"]
+            .as_str()
+            .context("tombstone has no replacement_room")?
+            .to_string();
+        info!("{room} was already upgraded to {new_room_id}, only transferring membership");
+        Some(new_room_id)
     } else {
         None
     };
@@ -161,7 +171,7 @@ async fn upgrade_room(
             } else {
                 users.insert(user_id.to_string(), json!(*pl));
             }
-            println!("Overrode power level for user {user_id} in room {room} to be {pl}")
+            info!("Overrode power level for {user_id} to be {pl}")
         }
 
         if config.target_room_version >= 12 {
@@ -183,7 +193,7 @@ async fn upgrade_room(
                 }));
             }
         }
-        println!("New state for {room}: {initial_state:#?}, power levels: {power_levels:#?}");
+        debug!("New state: {initial_state:#?}, power levels: {power_levels:#?}");
 
         let txn_id = Uuid::new_v4();
         let res = send(
@@ -204,7 +214,7 @@ async fn upgrade_room(
             .context("event_id is not a string")?
             .to_string();
 
-        println!("Last event ID: {last_event_id}");
+        debug!("Last event ID: {last_event_id}");
 
         let target_room_version = format!("{}", config.target_room_version);
 
@@ -248,6 +258,7 @@ async fn upgrade_room(
         .await?
         .json::<Value>()
         .await?;
+        info!("Created {new_room_id} and tombstoned {room}");
         new_room_id.to_string()
     };
 
@@ -284,8 +295,10 @@ async fn upgrade_room(
         )
         .await
         {
-            eprintln!("Failed to ban {user_id} in {new_room_id}: {err:#}");
+            warn!("Failed to ban {user_id}: {err:#}");
             failures += 1;
+        } else {
+            debug!("Banned {user_id}");
         }
     }
 
@@ -309,8 +322,10 @@ async fn upgrade_room(
         )
         .await
         {
-            eprintln!("Failed to invite {user_id} to {new_room_id}: {err:#}");
+            warn!("Failed to invite {user_id}: {err:#}");
             failures += 1;
+        } else {
+            debug!("Invited {user_id}");
         }
     }
     anyhow::ensure!(
@@ -383,7 +398,7 @@ async fn send_retrying(request: reqwest::RequestBuilder) -> anyhow::Result<reqwe
                 .map(Duration::from_millis),
         };
         let wait = retry_after.unwrap_or(backoff);
-        println!("Rate limited, retrying in {wait:?}");
+        warn!("Rate limited, retrying in {wait:?}");
         tokio::time::sleep(wait).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
