@@ -122,8 +122,9 @@ async fn create_replacement_room(
 
     let mut initial_state = Vec::new();
     for event_type in &config.state_events_to_transfer {
-        // Power levels are passed separately as power_level_content_override.
-        if event_type == "m.room.power_levels" {
+        // Power levels are passed separately as power_level_content_override, and the canonical
+        // alias can only be set once its aliases point to the new room, see move_aliases.
+        if event_type == "m.room.power_levels" || event_type == "m.room.canonical_alias" {
             continue;
         }
         if let Some(content) =
@@ -284,6 +285,14 @@ async fn upgrade_room(
         new_room_id
     };
     restrict_old_room(http_client, &config.homeserver_url, room).await?;
+    move_aliases(
+        http_client,
+        &config.homeserver_url,
+        self_user_id,
+        room,
+        &new_room_id,
+    )
+    .await?;
 
     let new_members_res = send(http_client.get(format!(
         "{}/_matrix/client/v3/rooms/{new_room_id}/members",
@@ -406,6 +415,175 @@ async fn restrict_old_room(
         info!("Made {room} invite only");
     }
     Ok(())
+}
+
+/// Moves the aliases, canonical alias and room directory listing of `room` to `new_room_id`.
+///
+/// Every step checks where things point now instead of assuming they haven't moved yet, so that
+/// an interrupted run can be resumed: aliases on our server are made to point to the new room
+/// whether they still point to the old one or were already deleted from it. Aliases on other
+/// servers can't be moved and are dropped from the canonical alias unless they already point to
+/// the new room.
+async fn move_aliases(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    self_user_id: &str,
+    room: &str,
+    new_room_id: &str,
+) -> anyhow::Result<()> {
+    let server_name = self_user_id
+        .split_once(':')
+        .context("user ID has no server name")?
+        .1;
+    let canonical_alias = get_state(http_client, homeserver_url, room, "m.room.canonical_alias")
+        .await?
+        .filter(|content| content.as_object().is_some_and(|map| !map.is_empty()));
+
+    let local_aliases = send(http_client.get(format!(
+        "{homeserver_url}/_matrix/client/v3/rooms/{room}/aliases"
+    )))
+    .await?
+    .json::<Value>()
+    .await?;
+    let mut aliases: HashSet<&str> = local_aliases["aliases"]
+        .as_array()
+        .context("aliases response has no aliases")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if let Some(canonical_alias) = &canonical_alias {
+        aliases.extend(
+            canonical_alias_entries(canonical_alias)
+                .filter(|alias| alias.ends_with(&format!(":{server_name}"))),
+        );
+    }
+
+    for alias in aliases {
+        let url = directory_url(homeserver_url, alias)?;
+        match resolve_alias(http_client, homeserver_url, alias).await? {
+            Some(target) if target == new_room_id => continue,
+            Some(target) if target == room => {
+                send(http_client.delete(url.clone())).await?;
+            }
+            Some(target) => {
+                warn!("{alias} points to {target} instead of {room}, leaving it alone");
+                continue;
+            }
+            None => {}
+        }
+        send(
+            http_client
+                .put(url)
+                .json(&json!({ "room_id": new_room_id })),
+        )
+        .await?;
+        info!("Pointed {alias} to {new_room_id}");
+    }
+
+    if let Some(mut canonical_alias) = canonical_alias {
+        let mut moved = HashSet::new();
+        for alias in canonical_alias_entries(&canonical_alias) {
+            if resolve_alias(http_client, homeserver_url, alias)
+                .await?
+                .as_deref()
+                == Some(new_room_id)
+            {
+                moved.insert(alias.to_string());
+            }
+        }
+        let map = canonical_alias
+            .as_object_mut()
+            .context("canonical alias is not an object")?;
+        if map
+            .get("alias")
+            .and_then(Value::as_str)
+            .is_some_and(|alias| !moved.contains(alias))
+        {
+            map.remove("alias");
+        }
+        if let Some(alt_aliases) = map.get_mut("alt_aliases").and_then(Value::as_array_mut) {
+            alt_aliases.retain(|alias| alias.as_str().is_some_and(|alias| moved.contains(alias)));
+        }
+        put_state(
+            http_client,
+            homeserver_url,
+            new_room_id,
+            "m.room.canonical_alias",
+            &canonical_alias,
+        )
+        .await?;
+        put_state(
+            http_client,
+            homeserver_url,
+            room,
+            "m.room.canonical_alias",
+            &json!({}),
+        )
+        .await?;
+        info!("Moved the canonical alias of {room} to {new_room_id}");
+    }
+
+    let visibility = send(http_client.get(format!(
+        "{homeserver_url}/_matrix/client/v3/directory/list/room/{room}"
+    )))
+    .await?
+    .json::<Value>()
+    .await?;
+    if visibility["visibility"] == "public" {
+        for (room, visibility) in [(new_room_id, "public"), (room, "private")] {
+            send(
+                http_client
+                    .put(format!(
+                        "{homeserver_url}/_matrix/client/v3/directory/list/room/{room}"
+                    ))
+                    .json(&json!({ "visibility": visibility })),
+            )
+            .await?;
+        }
+        info!("Replaced {room} with {new_room_id} in the room directory");
+    }
+    Ok(())
+}
+
+/// Lists the `alias` and `alt_aliases` in the content of an `m.room.canonical_alias` event.
+fn canonical_alias_entries(content: &Value) -> impl Iterator<Item = &str> {
+    content["alias"].as_str().into_iter().chain(
+        content["alt_aliases"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str),
+    )
+}
+
+/// Looks up the room an alias points to, or `None` if the alias doesn't exist.
+async fn resolve_alias(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    alias: &str,
+) -> anyhow::Result<Option<String>> {
+    let res = send_retrying(http_client.get(directory_url(homeserver_url, alias)?)).await?;
+    if res.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let body = error_for_status(res).await?.json::<Value>().await?;
+    Ok(Some(
+        body["room_id"]
+            .as_str()
+            .context("alias response has no room_id")?
+            .to_string(),
+    ))
+}
+
+/// Builds the room directory URL for `alias`, escaping the `#` it starts with.
+fn directory_url(homeserver_url: &str, alias: &str) -> anyhow::Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&format!(
+        "{homeserver_url}/_matrix/client/v3/directory/room"
+    ))?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("{homeserver_url} is not a valid base URL"))?
+        .push(alias);
+    Ok(url)
 }
 
 /// Reads a power level from the content of an `m.room.power_levels` event, where missing
