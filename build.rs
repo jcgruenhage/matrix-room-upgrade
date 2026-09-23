@@ -5,6 +5,7 @@ pub mod cli {
 }
 
 fn main() -> anyhow::Result<()> {
+    println!("cargo:rerun-if-changed=src/cli.rs");
     render_shell_completions::<cli::Cli>("generated/completions")?;
     render_manpages::<cli::Cli>("generated/man")?;
 
