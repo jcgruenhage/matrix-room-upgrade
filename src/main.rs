@@ -494,6 +494,8 @@ async fn upgrade_room(
             .context("tombstone has no replacement_room")?
             .to_string();
         info!("{room} was already upgraded to {new_room_id}, only transferring membership");
+        // Someone else may have upgraded the room.
+        join(http_client, &config.homeserver_url, &new_room_id).await?;
         Some(new_room_id)
     } else {
         None
