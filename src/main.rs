@@ -85,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    let fixes = plan_fixes(&http_client, &config, &self_user_id, &mut failures).await?;
     for (room, steps) in prepared_rooms {
         if let Err(err) = upgrade_room(
             &http_client,
@@ -101,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
             failures.add("upgrading rooms");
         }
     }
-    fix_outdated_references(&http_client, &config, &self_user_id, &mut failures).await?;
+    apply_fixes(&http_client, &config, &self_user_id, fixes, &mut failures).await?;
     anyhow::ensure!(
         failures.0.is_empty(),
         "some steps failed, see the warnings above and re-run to retry them: {failures}"
@@ -1090,57 +1091,66 @@ async fn move_aliases(
     Ok(())
 }
 
-/// Replacement room IDs by the ID of the room they replace, for the rooms in `room_states`.
-fn replacements(room_states: &[(String, Vec<Value>)]) -> HashMap<&str, &str> {
-    room_states
-        .iter()
-        .filter_map(|(room, room_state)| {
-            let tombstone = room_state
-                .iter()
-                .find(|event| event["type"] == "m.room.tombstone" && event["state_key"] == "")?;
-            Some((
-                room.as_str(),
-                tombstone["content"]["replacement_room"].as_str()?,
-            ))
-        })
-        .collect()
+/// Adds the replacement room IDs of the rooms in `room_states` that were upgraded to
+/// `replacements`, by the ID of the room they replace.
+fn add_replacements(
+    replacements: &mut HashMap<String, String>,
+    room_states: &[(String, Vec<Value>)],
+) {
+    for (room, room_state) in room_states {
+        let replacement = room_state
+            .iter()
+            .find(|event| event["type"] == "m.room.tombstone" && event["state_key"] == "")
+            .and_then(|tombstone| tombstone["content"]["replacement_room"].as_str());
+        if let Some(replacement) = replacement {
+            replacements.insert(room.clone(), replacement.to_string());
+        }
+    }
 }
 
 /// Follows the upgrades of `room` in `replacements`, returning the rooms that replaced it in
 /// order, which ends with the one that is current.
-fn replacement_chain<'a>(replacements: &HashMap<&'a str, &'a str>, room: &'a str) -> Vec<&'a str> {
+fn replacement_chain<'a>(replacements: &'a HashMap<String, String>, room: &'a str) -> Vec<&'a str> {
     let mut chain = Vec::new();
     let mut room = room;
-    while let Some(&replacement) = replacements.get(room) {
+    while let Some(replacement) = replacements.get(room) {
         // Rooms can't be upgraded to rooms they were upgraded from, but tombstones can say so.
-        if replacement == room || chain.contains(&replacement) {
+        if replacement == room || chain.contains(&replacement.as_str()) {
             break;
         }
-        chain.push(replacement);
+        chain.push(replacement.as_str());
         room = replacement;
     }
     chain
 }
 
-/// A change to a room's state that makes it refer to the current replacement of an upgraded room
-/// instead of the upgraded room.
+/// A change to a room's state that makes it refer to the current replacements of upgraded rooms
+/// instead of the upgraded rooms.
 struct Change {
     /// What the change does, phrased as an instruction.
     description: String,
+    /// The upgraded rooms the change stops referring to.
+    upgraded_rooms: Vec<String>,
     /// The state events to send, as their type, state key and content.
     events: Vec<(&'static str, String, Value)>,
 }
 
-/// Lists the changes that make `room_state` refer to the current replacements of upgraded rooms.
+/// Lists the changes that make `room_state` refer to the current replacements of upgraded rooms,
+/// for the upgraded rooms that `fix` returns true for.
 fn outdated_references(
     room: &str,
     room_state: &[Value],
-    replacements: &HashMap<&str, &str>,
+    replacements: &HashMap<String, String>,
+    fix: impl Fn(&str) -> bool,
 ) -> Vec<Change> {
-    let latest = |room: &str| {
-        replacements
-            .get_key_value(room)
-            .and_then(|(room, _)| replacement_chain(replacements, room).last().copied())
+    let latest = |upgraded_room: &str| {
+        let (upgraded_room, _) = replacements.get_key_value(upgraded_room)?;
+        if !fix(upgraded_room) {
+            return None;
+        }
+        replacement_chain(replacements, upgraded_room)
+            .last()
+            .copied()
     };
     let mut changes = Vec::new();
 
@@ -1151,6 +1161,7 @@ fn outdated_references(
     if let Some((join_rules, allow)) =
         join_rules.and_then(|content| Some((content, content["allow"].as_array()?)))
     {
+        let mut upgraded_rooms = Vec::new();
         let mut replaced = Vec::new();
         let mut new_allow: Vec<Value> = Vec::new();
         for condition in allow {
@@ -1161,6 +1172,7 @@ fn outdated_references(
                     .and_then(|old| Some((old.to_string(), latest(old)?)))
                 {
                     replaced.push(format!("{old} with {new}"));
+                    upgraded_rooms.push(old);
                     condition["room_id"] = json!(new);
                 }
             }
@@ -1176,6 +1188,7 @@ fn outdated_references(
                     "Replace {} in the join rules of {room}",
                     replaced.join(", ")
                 ),
+                upgraded_rooms,
                 events: vec![("m.room.join_rules", String::new(), content)],
             });
         }
@@ -1207,22 +1220,33 @@ fn outdated_references(
         };
         changes.push(Change {
             description,
+            upgraded_rooms: vec![old.to_string()],
             events,
         });
     }
     changes
 }
 
-/// Makes the rooms we're in refer to the current replacements of upgraded rooms, in their join
-/// rules and space hierarchy, and locks down the upgraded rooms we're in that aren't yet. Rooms in
-/// the config and their replacements are changed right away, any other room only if the user
-/// confirms.
-async fn fix_outdated_references(
+/// The references to upgraded rooms that the user agreed to fix after upgrading the rooms in the
+/// config, decided before upgrading any of them.
+struct Fixes {
+    /// Replacement room IDs by the ID of the room they replace, for the rooms that were upgraded
+    /// before this run.
+    replacements: HashMap<String, String>,
+    /// The upgraded rooms each room we're in may stop referring to, by the ID of that room.
+    approved: HashMap<String, HashSet<String>>,
+}
+
+/// Looks through the rooms we're in for references to upgraded rooms, or rooms in the config that
+/// are about to be, and asks which of them to fix after upgrading the rooms in the config. Rooms in
+/// the config and their replacements are fixed without asking. Also warns about aliases still
+/// leading to upgraded rooms outside the config, and offers to lock them down if they aren't yet.
+async fn plan_fixes(
     http_client: &reqwest::Client,
     config: &config::Config,
     self_user_id: &str,
     failures: &mut Failures,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Fixes> {
     let homeserver_url = &config.homeserver_url;
     let mut room_states = Vec::new();
     for room in joined_rooms(http_client, homeserver_url).await? {
@@ -1234,7 +1258,8 @@ async fn fix_outdated_references(
             }
         }
     }
-    let replacements = replacements(&room_states);
+    let mut replacements = HashMap::new();
+    add_replacements(&mut replacements, &room_states);
     let configured: HashSet<&str> = config
         .rooms
         .iter()
@@ -1242,12 +1267,20 @@ async fn fix_outdated_references(
             std::iter::once(room.as_str()).chain(replacement_chain(&replacements, room))
         })
         .collect();
+    // The rooms in the config that aren't upgraded yet will be, to rooms we don't know yet.
+    let mut planned_replacements = replacements.clone();
+    for room in &config.rooms {
+        planned_replacements
+            .entry(room.clone())
+            .or_insert_with(|| format!("the replacement of {room}"));
+    }
 
     let admin_api = admin_api_available(http_client, homeserver_url, self_user_id).await?;
+    let mut approved: HashMap<String, HashSet<String>> = HashMap::new();
     for (room, room_state) in &room_states {
         let power = Power::new(room_state)?;
         let mut level = power.user(self_user_id)?;
-        if let Some(replacement) = replacements.get(room.as_str()) {
+        if let Some(replacement) = replacements.get(room) {
             if !configured.contains(room.as_str()) {
                 match aliases_left_behind(http_client, homeserver_url, room, &power).await {
                     Ok(left_behind) if left_behind.is_empty() => {}
@@ -1291,7 +1324,7 @@ async fn fix_outdated_references(
             }
             continue;
         }
-        for change in outdated_references(room, room_state, &replacements) {
+        for change in outdated_references(room, room_state, &planned_replacements, |_| true) {
             let description = &change.description;
             if !configured.contains(room.as_str()) && !confirm(format!("{description}?"))? {
                 continue;
@@ -1316,12 +1349,93 @@ async fn fix_outdated_references(
                 warn!("Skipped: {description}, as we have power level {level} but need {needed}");
                 continue;
             }
+            approved
+                .entry(room.clone())
+                .or_default()
+                .extend(change.upgraded_rooms);
+        }
+    }
+    Ok(Fixes {
+        replacements,
+        approved,
+    })
+}
+
+/// Makes the rooms we're in refer to the current replacements of upgraded rooms where `fixes`
+/// says to, and makes the replacements of the rooms in the config do so too.
+async fn apply_fixes(
+    http_client: &reqwest::Client,
+    config: &config::Config,
+    self_user_id: &str,
+    fixes: Fixes,
+    failures: &mut Failures,
+) -> anyhow::Result<()> {
+    let homeserver_url = &config.homeserver_url;
+    let Fixes {
+        mut replacements,
+        mut approved,
+    } = fixes;
+    let mut rooms: HashSet<String> = approved.keys().cloned().collect();
+    for room in &config.rooms {
+        let tombstone =
+            match get_state(http_client, homeserver_url, room, "m.room.tombstone", "").await {
+                Ok(tombstone) => tombstone,
+                Err(err) => {
+                    warn!("Failed to find out what {room} was upgraded to: {err:#}");
+                    failures.add("updating references to upgraded rooms");
+                    continue;
+                }
+            };
+        if let Some(new_room_id) = tombstone
+            .as_ref()
+            .and_then(|tombstone| tombstone["replacement_room"].as_str())
+        {
+            replacements.insert(room.clone(), new_room_id.to_string());
+            // What the new room refers to comes from the old room, which is in the config.
+            rooms.insert(new_room_id.to_string());
+            approved.insert(
+                new_room_id.to_string(),
+                replacements.keys().cloned().collect(),
+            );
+        }
+    }
+
+    for room in rooms {
+        // Upgraded rooms, like the ones in the config now, aren't used anymore.
+        if replacements.contains_key(&room) {
+            continue;
+        }
+        let room_state = match room_state(http_client, homeserver_url, &room).await {
+            Ok(room_state) => room_state,
+            Err(err) => {
+                warn!("Failed to get the state of {room}: {err:#}");
+                failures.add("updating references to upgraded rooms");
+                continue;
+            }
+        };
+        let power = Power::new(&room_state)?;
+        let level = power.user(self_user_id)?;
+        let fix = |upgraded_room: &str| {
+            approved
+                .get(&room)
+                .is_some_and(|upgraded_rooms| upgraded_rooms.contains(upgraded_room))
+        };
+        for change in outdated_references(&room, &room_state, &replacements, fix) {
+            let description = &change.description;
+            let mut needed = int!(0);
+            for (event_type, _, _) in &change.events {
+                needed = needed.max(power.state_event(event_type)?);
+            }
+            if level < needed {
+                warn!("Skipped: {description}, as we have power level {level} but need {needed}");
+                continue;
+            }
             let result = async {
                 for (event_type, state_key, content) in &change.events {
                     put_state(
                         http_client,
                         homeserver_url,
-                        room,
+                        &room,
                         event_type,
                         state_key,
                         content,
