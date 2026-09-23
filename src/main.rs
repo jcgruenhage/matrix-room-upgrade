@@ -337,11 +337,20 @@ async fn prepare_room(
     {
         lock_down = lock_down.max(power_level(events, "m.room.join_rules", state_default)?);
     }
-    let move_aliases = if find("m.room.canonical_alias", "").is_some_and(|event| {
+    let mut has_aliases = find("m.room.canonical_alias", "").is_some_and(|event| {
         event["content"]
             .as_object()
             .is_some_and(|content| !content.is_empty())
-    }) {
+    });
+    // Deleting aliases we didn't create and changing the room directory need the power to change
+    // the canonical alias too, unless we're a server admin.
+    if !has_aliases && !admin_api {
+        has_aliases = !local_aliases(http_client, homeserver_url, room)
+            .await?
+            .is_empty()
+            || is_published(http_client, homeserver_url, room).await?;
+    }
+    let move_aliases = if has_aliases {
         power_level(events, "m.room.canonical_alias", state_default)?
     } else {
         int!(0)
@@ -731,26 +740,19 @@ async fn move_aliases(
     .await?
     .filter(|content| content.as_object().is_some_and(|map| !map.is_empty()));
 
-    let local_aliases = send(http_client.get(format!(
-        "{homeserver_url}/_matrix/client/v3/rooms/{room}/aliases"
-    )))
-    .await?
-    .json::<Value>()
-    .await?;
-    let mut aliases: HashSet<&str> = local_aliases["aliases"]
-        .as_array()
-        .context("aliases response has no aliases")?
-        .iter()
-        .filter_map(Value::as_str)
+    let mut aliases: HashSet<String> = local_aliases(http_client, homeserver_url, room)
+        .await?
+        .into_iter()
         .collect();
     if let Some(canonical_alias) = &canonical_alias {
         aliases.extend(
             canonical_alias_entries(canonical_alias)
-                .filter(|alias| alias.ends_with(&format!(":{server_name}"))),
+                .filter(|alias| alias.ends_with(&format!(":{server_name}")))
+                .map(str::to_string),
         );
     }
 
-    for alias in aliases {
+    for alias in &aliases {
         let url = directory_url(homeserver_url, alias)?;
         match resolve_alias(http_client, homeserver_url, alias).await? {
             Some(target) if target == new_room_id => continue,
@@ -817,13 +819,7 @@ async fn move_aliases(
         info!("Moved the canonical alias of {room} to {new_room_id}");
     }
 
-    let visibility = send(http_client.get(format!(
-        "{homeserver_url}/_matrix/client/v3/directory/list/room/{room}"
-    )))
-    .await?
-    .json::<Value>()
-    .await?;
-    if visibility["visibility"] == "public" {
+    if is_published(http_client, homeserver_url, room).await? {
         let set_visibility = |room: &str, visibility: &str| {
             send(
                 http_client
@@ -843,6 +839,42 @@ async fn move_aliases(
         }
     }
     Ok(())
+}
+
+/// Lists the aliases our server has for `room`.
+async fn local_aliases(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    room: &str,
+) -> anyhow::Result<Vec<String>> {
+    let res = send(http_client.get(format!(
+        "{homeserver_url}/_matrix/client/v3/rooms/{room}/aliases"
+    )))
+    .await?
+    .json::<Value>()
+    .await?;
+    Ok(res["aliases"]
+        .as_array()
+        .context("aliases response has no aliases")?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect())
+}
+
+/// Whether `room` is published in the room directory.
+async fn is_published(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    room: &str,
+) -> anyhow::Result<bool> {
+    let res = send(http_client.get(format!(
+        "{homeserver_url}/_matrix/client/v3/directory/list/room/{room}"
+    )))
+    .await?
+    .json::<Value>()
+    .await?;
+    Ok(res["visibility"] == "public")
 }
 
 /// Replaces `room` with `new_room_id` in the spaces that `room` names as its parents, and names
