@@ -649,8 +649,7 @@ async fn upgrade_room(
         failures += 1;
     }
     failures += move_space_parents(http_client, &config.homeserver_url, room, &new_room_id).await?;
-    failures +=
-        move_join_rule_references(http_client, &config.homeserver_url, room, &new_room_id).await?;
+    failures += move_references(http_client, &config.homeserver_url, room, &new_room_id).await?;
 
     let new_members_res = send(http_client.get(url(
         &config.homeserver_url,
@@ -921,10 +920,9 @@ async fn move_aliases(
     Ok(())
 }
 
-/// Lets members of `new_room_id` join the rooms we're in whose restricted join rules let members
-/// of `room` join. Members of `room` stay allowed, as not all of them will have moved yet. Returns
-/// how many rooms couldn't be updated, e.g. because we lack the power level to change them.
-async fn move_join_rule_references(
+/// Updates the rooms we're in that refer to `room` to refer to `new_room_id`. Returns how many
+/// updates failed, e.g. because we lack the power level to make them.
+async fn move_references(
     http_client: &reqwest::Client,
     homeserver_url: &str,
     room: &str,
@@ -939,11 +937,19 @@ async fn move_join_rule_references(
             warn!("Failed to allow members of {new_room_id} to join {other_room}: {err:#}");
             failures += 1;
         }
+        if let Err(err) =
+            move_space_parent_reference(http_client, homeserver_url, room, new_room_id, &other_room)
+                .await
+        {
+            warn!("Failed to make {new_room_id} a parent of {other_room}: {err:#}");
+            failures += 1;
+        }
     }
     Ok(failures)
 }
 
 /// Lets members of `new_room_id` join `other_room` if its join rules let members of `room` join.
+/// Members of `room` stay allowed, as not all of them will have moved yet.
 async fn move_join_rule_reference(
     http_client: &reqwest::Client,
     homeserver_url: &str,
@@ -984,6 +990,47 @@ async fn move_join_rule_reference(
     )
     .await?;
     info!("Allowed members of {new_room_id} to join {other_room}");
+    Ok(())
+}
+
+/// Replaces `room` with `new_room_id` as a parent space of `other_room`, if it is one.
+async fn move_space_parent_reference(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    room: &str,
+    new_room_id: &str,
+    other_room: &str,
+) -> anyhow::Result<()> {
+    let Some(content) = get_state(
+        http_client,
+        homeserver_url,
+        other_room,
+        "m.space.parent",
+        room,
+    )
+    .await?
+    .filter(has_via) else {
+        return Ok(());
+    };
+    put_state(
+        http_client,
+        homeserver_url,
+        other_room,
+        "m.space.parent",
+        new_room_id,
+        &content,
+    )
+    .await?;
+    put_state(
+        http_client,
+        homeserver_url,
+        other_room,
+        "m.space.parent",
+        room,
+        &json!({}),
+    )
+    .await?;
+    info!("Replaced {room} with {new_room_id} as a parent of {other_room}");
     Ok(())
 }
 
