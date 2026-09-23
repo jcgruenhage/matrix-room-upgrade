@@ -320,13 +320,7 @@ async fn prepare_room(
             .max(power.event("m.room.message")?)
     };
     let lock_down = power.lock_down()?;
-    let mut has_aliases = power
-        .find("m.room.canonical_alias", "")
-        .is_some_and(|event| {
-            event["content"]
-                .as_object()
-                .is_some_and(|content| !content.is_empty())
-        });
+    let mut has_aliases = power.has_canonical_alias();
     // Deleting aliases we didn't create and changing the room directory need the power to change
     // the canonical alias too, unless we're a server admin.
     if !has_aliases && !admin_api {
@@ -478,6 +472,16 @@ impl<'a> Power<'a> {
         self.room_state
             .iter()
             .find(|event| event["type"] == event_type && event["state_key"] == state_key)
+    }
+
+    /// Whether the room has a canonical alias.
+    fn has_canonical_alias(&self) -> bool {
+        self.find("m.room.canonical_alias", "")
+            .is_some_and(|event| {
+                event["content"]
+                    .as_object()
+                    .is_some_and(|content| !content.is_empty())
+            })
     }
 
     /// Reads the power level stored under `key`, falling back to `default` if it's missing.
@@ -1225,6 +1229,19 @@ async fn fix_outdated_references(
         let power = Power::new(room_state)?;
         let mut level = power.user(self_user_id)?;
         if let Some(replacement) = replacements.get(room.as_str()) {
+            if !configured.contains(room.as_str()) {
+                match aliases_left_behind(http_client, homeserver_url, room, &power).await {
+                    Ok(left_behind) if left_behind.is_empty() => {}
+                    Ok(left_behind) => warn!(
+                        "{room} was upgraded to {replacement}, but {} still point to it",
+                        left_behind.join(", ")
+                    ),
+                    Err(err) => {
+                        warn!("Failed to check whether aliases still point to {room}: {err:#}");
+                        failures += 1;
+                    }
+                }
+            }
             // Rooms in the config are locked down when upgrading them, unless we were told not to.
             let needed = power.lock_down()?;
             if configured.contains(room.as_str())
@@ -1305,6 +1322,30 @@ async fn fix_outdated_references(
         }
     }
     Ok(failures)
+}
+
+/// Describes what still leads people to `room` through aliases or the room directory, which only
+/// upgrading the rooms in the config moves to their replacements.
+async fn aliases_left_behind(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    room: &str,
+    power: &Power<'_>,
+) -> anyhow::Result<Vec<&'static str>> {
+    let mut left_behind = Vec::new();
+    if power.has_canonical_alias() {
+        left_behind.push("its canonical alias");
+    }
+    if !local_aliases(http_client, homeserver_url, room)
+        .await?
+        .is_empty()
+    {
+        left_behind.push("its local aliases");
+    }
+    if is_published(http_client, homeserver_url, room).await? {
+        left_behind.push("its room directory listing");
+    }
+    Ok(left_behind)
 }
 
 /// Lists the aliases our server has for `room`.
