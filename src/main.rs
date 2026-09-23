@@ -249,28 +249,27 @@ async fn main() -> anyhow::Result<()> {
             .collect();
         dbg!(&new_members);
 
+        let mut failures = 0;
         for (user_id, reason) in banned_members.iter() {
             if new_members.contains(user_id.as_str()) {
                 continue;
             }
-            dbg!(
-                dbg!(
-                    send(
-                        http_client
-                            .post(format!(
-                                "{}/_matrix/client/v3/rooms/{new_room_id}/ban",
-                                config.homeserver_url
-                            ))
-                            .json(&json!({
-                                "reason": reason,
-                                "user_id": user_id,
-                            }))
-                    )
-                    .await?
-                )
-                .text()
-                .await?
-            );
+            if let Err(err) = send(
+                http_client
+                    .post(format!(
+                        "{}/_matrix/client/v3/rooms/{new_room_id}/ban",
+                        config.homeserver_url
+                    ))
+                    .json(&json!({
+                        "reason": reason,
+                        "user_id": user_id,
+                    })),
+            )
+            .await
+            {
+                eprintln!("Failed to ban {user_id} in {new_room_id}: {err:#}");
+                failures += 1;
+            }
         }
 
         for (user_id, reason) in joined_members.iter() {
@@ -280,25 +279,27 @@ async fn main() -> anyhow::Result<()> {
             {
                 continue;
             }
-            dbg!(
-                dbg!(
-                    send(
-                        http_client
-                            .post(format!(
-                                "{}/_matrix/client/v3/rooms/{new_room_id}/invite",
-                                config.homeserver_url
-                            ))
-                            .json(&json!({
-                                "reason": reason,
-                                "user_id": user_id,
-                            }))
-                    )
-                    .await?
-                )
-                .text()
-                .await?
-            );
+            if let Err(err) = send(
+                http_client
+                    .post(format!(
+                        "{}/_matrix/client/v3/rooms/{new_room_id}/invite",
+                        config.homeserver_url
+                    ))
+                    .json(&json!({
+                        "reason": reason,
+                        "user_id": user_id,
+                    })),
+            )
+            .await
+            {
+                eprintln!("Failed to invite {user_id} to {new_room_id}: {err:#}");
+                failures += 1;
+            }
         }
+        anyhow::ensure!(
+            failures == 0,
+            "{failures} bans/invites in {new_room_id} failed, re-run to retry them"
+        );
     }
     Ok(())
 }
