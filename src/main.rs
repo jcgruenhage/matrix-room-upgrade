@@ -5,8 +5,10 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 use directories::ProjectDirs;
+use js_int::{int, Int};
 use log::{debug, error, info, warn, LevelFilter};
 use reqwest::{header, StatusCode};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -120,7 +122,8 @@ async fn create_replacement_room(
     let map = power_levels
         .as_object_mut()
         .context("PL state is not an object")?;
-    let users_default = power_level(map, "users_default", 0)?;
+    normalize_power_levels(map)?;
+    let users_default = power_level(map, "users_default", int!(0))?;
     let users = map
         .get_mut("users")
         .context("PL state does not contain users key")?
@@ -290,13 +293,13 @@ async fn prepare_room(
         None => Ok(&empty),
     };
     let (events, users) = (map("events")?, map("users")?);
-    let state_default = power_level(power_levels, "state_default", 50)?;
-    let events_default = power_level(power_levels, "events_default", 0)?;
-    let users_default = power_level(power_levels, "users_default", 0)?;
+    let state_default = power_level(power_levels, "state_default", int!(50))?;
+    let events_default = power_level(power_levels, "events_default", int!(0))?;
+    let users_default = power_level(power_levels, "users_default", int!(0))?;
 
     // The power needed for each step, counting only changes that are still to be made.
     let upgrade = if find("m.room.tombstone", "").is_some() {
-        0
+        int!(0)
     } else {
         power_level(events, "m.room.tombstone", state_default)?.max(power_level(
             events,
@@ -304,9 +307,9 @@ async fn prepare_room(
             events_default,
         )?)
     };
-    let mut lock_down = 0;
-    let restricted = 50.max(users_default + 1);
-    if events_default < restricted || power_level(power_levels, "invite", 0)? < restricted {
+    let mut lock_down = int!(0);
+    let restricted = int!(50).max(users_default.saturating_add(int!(1)));
+    if events_default < restricted || power_level(power_levels, "invite", int!(0))? < restricted {
         lock_down = restricted.max(power_level(events, "m.room.power_levels", state_default)?);
     }
     if find("m.room.join_rules", "").is_some_and(|event| event["content"]["join_rule"] != "invite")
@@ -320,7 +323,7 @@ async fn prepare_room(
     }) {
         power_level(events, "m.room.canonical_alias", state_default)?
     } else {
-        0
+        int!(0)
     };
 
     let mut level = power_level(users, self_user_id, users_default)?;
@@ -334,19 +337,16 @@ async fn prepare_room(
         // local user with the most power, as long as they're joined. We get the level of that
         // user, or 100 for creators. Among users with the same level it may pick another one.
         let own_server = server_name(self_user_id)?;
-        let mut candidates: Vec<(&str, u64)> = users
+        let mut candidates = users
             .iter()
-            .filter_map(|(user, level)| Some((user.as_str(), level.as_u64()?)))
-            .collect();
+            .map(|(user, level)| Ok((user.as_str(), parse_power_level(user, level)?)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
         candidates.sort_by_key(|(_, level)| std::cmp::Reverse(*level));
         let candidate = creators
             .iter()
-            .map(|creator| {
-                (
-                    *creator,
-                    users.get(*creator).and_then(Value::as_u64).unwrap_or(100),
-                )
-            })
+            .map(|creator| Ok((*creator, power_level(users, creator, int!(100))?)))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
             .chain(candidates)
             .find(|(user, _)| {
                 server_name(user).is_ok_and(|server| server == own_server)
@@ -356,7 +356,7 @@ async fn prepare_room(
         if let Some((admin_user, granted)) = candidate.filter(|(_, granted)| *granted > level) {
             let needed = needed
                 .iter()
-                .filter(|(_, required)| *required > 0)
+                .filter(|(_, required)| *required > int!(0))
                 .map(|(step, required)| format!("{required} to {step}"))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -382,7 +382,7 @@ async fn prepare_room(
         level >= upgrade,
         "we have power level {level} in {room}, but need {upgrade} to upgrade it"
     );
-    let do_step = |step: &str, required: u64| {
+    let do_step = |step: &str, required: Int| {
         if level >= required {
             return Ok(true);
         }
@@ -646,10 +646,11 @@ async fn restrict_old_room(
     let map = power_levels
         .as_object_mut()
         .context("PL state is not an object")?;
-    let restricted = 50.max(power_level(map, "users_default", 0)? + 1);
+    let restricted =
+        int!(50).max(power_level(map, "users_default", int!(0))?.saturating_add(int!(1)));
     let mut changed = false;
     for key in ["events_default", "invite"] {
-        if power_level(map, key, 0)? < restricted {
+        if power_level(map, key, int!(0))? < restricted {
             map.insert(key.to_string(), json!(restricted));
             changed = true;
         }
@@ -973,14 +974,37 @@ fn directory_url(homeserver_url: &str, alias: &str) -> anyhow::Result<reqwest::U
 fn power_level(
     power_levels: &serde_json::Map<String, Value>,
     key: &str,
-    default: u64,
-) -> anyhow::Result<u64> {
+    default: Int,
+) -> anyhow::Result<Int> {
     match power_levels.get(key) {
-        Some(level) => level
-            .as_u64()
-            .with_context(|| format!("PL state key {key} is not a u64")),
+        Some(level) => parse_power_level(key, level),
         None => Ok(default),
     }
+}
+
+/// Parses the power level stored under `key`, which room versions before 10 also allow to be a
+/// string.
+fn parse_power_level(key: &str, level: &Value) -> anyhow::Result<Int> {
+    match level {
+        Value::String(level) => level.parse().map_err(anyhow::Error::from),
+        level => Int::deserialize(level).map_err(anyhow::Error::from),
+    }
+    .with_context(|| format!("PL state key {key} is not an integer"))
+}
+
+/// Rewrites the power levels in the content of an `m.room.power_levels` event that are strings
+/// as integers, which room version 10 and later require.
+fn normalize_power_levels(power_levels: &mut serde_json::Map<String, Value>) -> anyhow::Result<()> {
+    for (key, value) in power_levels.iter_mut() {
+        if let Value::Object(levels) = value {
+            for (key, level) in levels.iter_mut() {
+                *level = json!(parse_power_level(key, level)?);
+            }
+        } else {
+            *value = json!(parse_power_level(key, value)?);
+        }
+    }
+    Ok(())
 }
 
 /// Extracts the server name from a user ID.
