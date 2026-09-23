@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
+use directories::ProjectDirs;
 use log::{debug, error, info, warn, LevelFilter};
 use reqwest::{header, StatusCode};
 use serde_json::{json, Value};
@@ -15,6 +16,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 mod cli;
 mod config;
+mod state;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,6 +34,13 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("failed to open {}", cli.config.display()))?;
     let config: config::Config = serde_yaml::from_reader(config_file)
         .with_context(|| format!("failed to parse {}", cli.config.display()))?;
+    let dirs = ProjectDirs::from("", "", env!("CARGO_PKG_NAME"))
+        .context("failed to determine the home directory")?;
+    let mut state = state::State::load(
+        dirs.state_dir()
+            .unwrap_or(dirs.data_local_dir())
+            .join("state.json"),
+    )?;
 
     let mut headers = header::HeaderMap::new();
     headers.insert(
@@ -60,7 +69,8 @@ async fn main() -> anyhow::Result<()> {
 
     let mut failed_rooms = Vec::new();
     for room in &config.rooms {
-        if let Err(err) = upgrade_room(&http_client, &config, &self_user_id, room).await {
+        if let Err(err) = upgrade_room(&http_client, &config, &mut state, &self_user_id, room).await
+        {
             error!("Failed to upgrade {room}: {err:#}");
             failed_rooms.push(room);
         }
@@ -72,9 +82,122 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Posts an upgrade notice in `room` and creates the room replacing it, returning its ID.
+async fn create_replacement_room(
+    http_client: &reqwest::Client,
+    config: &config::Config,
+    self_user_id: &str,
+    room: &str,
+) -> anyhow::Result<String> {
+    let mut power_levels = get_state(
+        http_client,
+        &config.homeserver_url,
+        room,
+        "m.room.power_levels",
+    )
+    .await?
+    .context("room has no power levels")?;
+    let map = power_levels
+        .as_object_mut()
+        .context("PL state is not an object")?;
+    let users_default = match map.get("users_default") {
+        Some(num) => num
+            .as_number()
+            .context("PL state key users_default is not a number")?
+            .as_u64()
+            .context("PL state key users_default is not a u64")?,
+        None => 0,
+    };
+    let users = map
+        .get_mut("users")
+        .context("PL state does not contain users key")?
+        .as_object_mut()
+        .context("PL state key users is not an object")?;
+
+    for (user_id, pl) in config.pl_overrides.iter() {
+        if users_default == *pl {
+            users.remove(user_id);
+        } else {
+            users.insert(user_id.to_string(), json!(*pl));
+        }
+        info!("Overrode power level for {user_id} to be {pl}")
+    }
+
+    if config.target_room_version >= 12 {
+        users.remove(self_user_id);
+    }
+
+    let mut initial_state = Vec::new();
+    for event_type in &config.state_events_to_transfer {
+        // Power levels are passed separately as power_level_content_override.
+        if event_type == "m.room.power_levels" {
+            continue;
+        }
+        if let Some(content) =
+            get_state(http_client, &config.homeserver_url, room, event_type).await?
+        {
+            initial_state.push(json!({
+                "content": content,
+                "type": event_type,
+            }));
+        }
+    }
+    debug!("New state: {initial_state:#?}, power levels: {power_levels:#?}");
+
+    let txn_id = Uuid::new_v4();
+    let res = send(
+        http_client
+            .put(format!(
+                "{}/_matrix/client/v3/rooms/{room}/send/m.room.message/{txn_id}",
+                config.homeserver_url
+            ))
+            .json(&json!({
+                "body": "Upgrading room, please stand by",
+                "msgtype": "m.text"
+            }
+            )),
+    )
+    .await?;
+    let last_event_id = res.json::<Value>().await?["event_id"]
+        .as_str()
+        .context("event_id is not a string")?
+        .to_string();
+
+    debug!("Last event ID: {last_event_id}");
+
+    let target_room_version = format!("{}", config.target_room_version);
+
+    let new_room_body = send(
+        http_client
+            .post(format!(
+                "{}/_matrix/client/v3/createRoom",
+                config.homeserver_url
+            ))
+            .json(&json!({
+                "creation_content": {
+                    "predecessor": {
+                        "event_id": last_event_id,
+                        "room_id": room,
+                    },
+                },
+                "room_version": target_room_version,
+                "power_level_content_override": power_levels,
+                "initial_state": initial_state,
+            })),
+    )
+    .await?
+    .json::<Value>()
+    .await?;
+    Ok(new_room_body["room_id"]
+        .as_str()
+        .context("room id is not a string")?
+        .to_string())
+}
+
 async fn upgrade_room(
     http_client: &reqwest::Client,
     config: &config::Config,
+    state: &mut state::State,
     self_user_id: &str,
     room: &str,
 ) -> anyhow::Result<()> {
@@ -135,108 +258,19 @@ async fn upgrade_room(
     let new_room_id = if let Some(new_room_id) = new_room_id {
         new_room_id
     } else {
-        let mut power_levels = get_state(
-            http_client,
-            &config.homeserver_url,
-            room,
-            "m.room.power_levels",
-        )
-        .await?
-        .context("room has no power levels")?;
-        let map = power_levels
-            .as_object_mut()
-            .context("PL state is not an object")?;
-        let users_default = match map.get("users_default") {
-            Some(num) => num
-                .as_number()
-                .context("PL state key users_default is not a number")?
-                .as_u64()
-                .context("PL state key users_default is not a u64")?,
-            None => 0,
+        let new_room_id = if let Some(new_room_id) = state.replacement_rooms.get(room) {
+            info!("Resuming the upgrade to {new_room_id}, which was created on a previous run");
+            new_room_id.clone()
+        } else {
+            let new_room_id =
+                create_replacement_room(http_client, config, self_user_id, room).await?;
+            state
+                .replacement_rooms
+                .insert(room.to_string(), new_room_id.clone());
+            state.save()?;
+            info!("Created {new_room_id}");
+            new_room_id
         };
-        let users = map
-            .get_mut("users")
-            .context("PL state does not contain users key")?
-            .as_object_mut()
-            .context("PL state key users is not an object")?;
-
-        for (user_id, pl) in config.pl_overrides.iter() {
-            if users_default == *pl {
-                users.remove(user_id);
-            } else {
-                users.insert(user_id.to_string(), json!(*pl));
-            }
-            info!("Overrode power level for {user_id} to be {pl}")
-        }
-
-        if config.target_room_version >= 12 {
-            users.remove(self_user_id);
-        }
-
-        let mut initial_state = Vec::new();
-        for event_type in &config.state_events_to_transfer {
-            // Power levels are passed separately as power_level_content_override.
-            if event_type == "m.room.power_levels" {
-                continue;
-            }
-            if let Some(content) =
-                get_state(http_client, &config.homeserver_url, room, event_type).await?
-            {
-                initial_state.push(json!({
-                    "content": content,
-                    "type": event_type,
-                }));
-            }
-        }
-        debug!("New state: {initial_state:#?}, power levels: {power_levels:#?}");
-
-        let txn_id = Uuid::new_v4();
-        let res = send(
-            http_client
-                .put(format!(
-                    "{}/_matrix/client/v3/rooms/{room}/send/m.room.message/{txn_id}",
-                    config.homeserver_url
-                ))
-                .json(&json!({
-                    "body": "Upgrading room, please stand by",
-                    "msgtype": "m.text"
-                }
-                )),
-        )
-        .await?;
-        let last_event_id = res.json::<Value>().await?["event_id"]
-            .as_str()
-            .context("event_id is not a string")?
-            .to_string();
-
-        debug!("Last event ID: {last_event_id}");
-
-        let target_room_version = format!("{}", config.target_room_version);
-
-        let new_room_body = send(
-            http_client
-                .post(format!(
-                    "{}/_matrix/client/v3/createRoom",
-                    config.homeserver_url
-                ))
-                .json(&json!({
-                    "creation_content": {
-                        "predecessor": {
-                            "event_id": last_event_id,
-                            "room_id": room,
-                        },
-                    },
-                    "room_version": target_room_version,
-                    "power_level_content_override": power_levels,
-                    "initial_state": initial_state,
-                })),
-        )
-        .await?
-        .json::<Value>()
-        .await?;
-        let new_room_id = new_room_body["room_id"]
-            .as_str()
-            .context("room id is not a string")?;
 
         send(
             http_client
@@ -252,8 +286,8 @@ async fn upgrade_room(
         .await?
         .json::<Value>()
         .await?;
-        info!("Created {new_room_id} and tombstoned {room}");
-        new_room_id.to_string()
+        info!("Tombstoned {room}");
+        new_room_id
     };
 
     let new_members_res = send(http_client.get(format!(
