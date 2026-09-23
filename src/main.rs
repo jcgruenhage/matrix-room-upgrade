@@ -46,14 +46,15 @@ async fn main() -> anyhow::Result<()> {
     let self_user_id = dbg!(self_user_id_res["user_id"].as_str().unwrap().to_string());
 
     for room in config.rooms {
-        let tombstone = send(http_client.get(format!(
-            "{}/_matrix/client/v3/rooms/{room}/state/m.room.tombstone/",
-            config.homeserver_url
-        )))
+        let tombstone = get_state(
+            &http_client,
+            &config.homeserver_url,
+            &room,
+            "m.room.tombstone",
+        )
         .await?;
-        let new_room_id = if tombstone.status() == StatusCode::OK {
+        let new_room_id = if let Some(tombstone_content) = tombstone {
             println!("Room upgraded already, only transferring membership state");
-            let tombstone_content: serde_json::Value = dbg!(tombstone.json().await?);
             Some(
                 tombstone_content
                     .get("replacement_room")
@@ -112,15 +113,11 @@ async fn main() -> anyhow::Result<()> {
         let new_room_id = if new_room_id.is_none() {
             let mut state: HashMap<String, Value> = HashMap::new();
             for event_type in &config.state_events_to_transfer {
-                let res = send(http_client.get(format!(
-                    "{}/_matrix/client/v3/rooms/{room}/state/{event_type}/",
-                    config.homeserver_url
-                )))
-                .await?;
-                if res.status() != StatusCode::OK {
+                let Some(mut val) =
+                    get_state(&http_client, &config.homeserver_url, &room, event_type).await?
+                else {
                     continue;
-                }
-                let mut val: Value = res.json().await?;
+                };
                 if event_type == "m.room.power_levels" {
                     let map = val.as_object_mut().context("PL state is not an object")?;
                     let users_default = match map.get("users_default") {
@@ -306,9 +303,44 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Fetches the content of a state event with an empty state key, or `None` if the room has no
+/// such state event.
+async fn get_state(
+    http_client: &reqwest::Client,
+    homeserver_url: &str,
+    room: &str,
+    event_type: &str,
+) -> anyhow::Result<Option<Value>> {
+    let res = send_retrying(http_client.get(format!(
+        "{homeserver_url}/_matrix/client/v3/rooms/{room}/state/{event_type}/"
+    )))
+    .await?;
+    if res.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    Ok(Some(error_for_status(res).await?.json().await?))
+}
+
+/// Sends a request like `send_retrying`, failing on any non-success response.
+async fn send(request: reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
+    error_for_status(send_retrying(request).await?).await
+}
+
+/// Turns a non-success response into an error carrying the response body, which for Matrix
+/// errors holds the `errcode` and `error`.
+async fn error_for_status(res: reqwest::Response) -> anyhow::Result<reqwest::Response> {
+    let status = res.status();
+    if status.is_success() {
+        return Ok(res);
+    }
+    let url = res.url().clone();
+    let body = res.text().await?;
+    anyhow::bail!("{url} returned {status}: {body}")
+}
+
 /// Sends a request, retrying while the server rate limits us. Waits as long as the server asks
 /// via `Retry-After` or `retry_after_ms`, otherwise backs off exponentially up to `MAX_BACKOFF`.
-async fn send(request: reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
+async fn send_retrying(request: reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
     let mut backoff = INITIAL_BACKOFF;
     loop {
         let res = request
