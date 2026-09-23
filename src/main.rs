@@ -523,7 +523,11 @@ async fn upgrade_room(
                 .as_str()
                 .context("member event has no state_key")?
                 .to_string(),
-            member["content"]["reason"].as_str().map(str::to_string),
+            // The reason given for joining is the joining user's own, not one to invite them with.
+            member["content"]["reason"]
+                .as_str()
+                .filter(|_| membership != "join")
+                .map(str::to_string),
         );
         match membership {
             "join" | "invite" => joined_members.push(entry),
