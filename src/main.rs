@@ -1191,8 +1191,9 @@ fn outdated_references(
 }
 
 /// Makes the rooms we're in refer to the current replacements of upgraded rooms, in their join
-/// rules and space hierarchy. Rooms in the config and their replacements are changed right away,
-/// any other room only if the user confirms. Returns how many changes failed.
+/// rules and space hierarchy, and locks down the upgraded rooms we're in that aren't yet. Rooms in
+/// the config and their replacements are changed right away, any other room only if the user
+/// confirms. Returns how many changes failed.
 async fn fix_outdated_references(
     http_client: &reqwest::Client,
     config: &config::Config,
@@ -1221,11 +1222,39 @@ async fn fix_outdated_references(
 
     let admin_api = admin_api_available(http_client, homeserver_url, self_user_id).await?;
     for (room, room_state) in &room_states {
-        if replacements.contains_key(room.as_str()) {
-            continue;
-        }
         let power = Power::new(room_state)?;
         let mut level = power.user(self_user_id)?;
+        if let Some(replacement) = replacements.get(room.as_str()) {
+            // Rooms in the config are locked down when upgrading them, unless we were told not to.
+            let needed = power.lock_down()?;
+            if configured.contains(room.as_str())
+                || needed == int!(0)
+                || !confirm(format!(
+                    "{room} was upgraded to {replacement}, but isn't locked down yet. Lock it down?"
+                ))?
+            {
+                continue;
+            }
+            if admin_api && level < needed {
+                level = offer_make_room_admin(
+                    http_client,
+                    homeserver_url,
+                    self_user_id,
+                    room,
+                    &power,
+                    level,
+                    &needed.to_string(),
+                )
+                .await?;
+            }
+            if level < needed {
+                warn!("Not locking down {room}, as we have power level {level} but need {needed}");
+            } else if let Err(err) = restrict_old_room(http_client, homeserver_url, room).await {
+                warn!("Failed to lock down {room}: {err:#}");
+                failures += 1;
+            }
+            continue;
+        }
         for change in outdated_references(room, room_state, &replacements) {
             let description = &change.description;
             if !configured.contains(room.as_str()) && !confirm(format!("{description}?"))? {
