@@ -570,25 +570,28 @@ async fn upgrade_room(
         }
         new_room_id
     };
-    if steps.lock_down {
-        restrict_old_room(http_client, &config.homeserver_url, room).await?;
-    } else {
+    let mut failures = 0;
+    if !steps.lock_down {
         warn!("Not locking down {room}");
+    } else if let Err(err) = restrict_old_room(http_client, &config.homeserver_url, room).await {
+        warn!("Failed to lock down {room}: {err:#}");
+        failures += 1;
     }
-    if steps.move_aliases {
-        move_aliases(
-            http_client,
-            &config.homeserver_url,
-            self_user_id,
-            room,
-            &new_room_id,
-        )
-        .await?;
-    } else {
+    if !steps.move_aliases {
         warn!("Not moving the aliases of {room}");
+    } else if let Err(err) = move_aliases(
+        http_client,
+        &config.homeserver_url,
+        self_user_id,
+        room,
+        &new_room_id,
+    )
+    .await
+    {
+        warn!("Failed to move the aliases of {room}: {err:#}");
+        failures += 1;
     }
-    let mut failures =
-        move_space_parents(http_client, &config.homeserver_url, room, &new_room_id).await?;
+    failures += move_space_parents(http_client, &config.homeserver_url, room, &new_room_id).await?;
 
     let new_members_res = send(http_client.get(format!(
         "{}/_matrix/client/v3/rooms/{new_room_id}/members",
@@ -657,7 +660,7 @@ async fn upgrade_room(
     }
     anyhow::ensure!(
         failures == 0,
-        "{failures} space updates, bans or invites failed, re-run to retry them"
+        "{failures} steps of the upgrade failed, re-run to retry them"
     );
     Ok(())
 }
