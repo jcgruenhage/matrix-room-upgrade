@@ -185,6 +185,17 @@ async fn create_replacement_room(
             }));
         }
     }
+    // Without a preset, createRoom uses private_chat, which lets guests join. Rooms without guest
+    // access don't, so we keep that unless the old room's guest access is transferred.
+    if !initial_state
+        .iter()
+        .any(|event| event["type"] == "m.room.guest_access")
+    {
+        initial_state.push(json!({
+            "content": { "guest_access": "forbidden" },
+            "type": "m.room.guest_access",
+        }));
+    }
     debug!("New state: {initial_state:#?}, power levels: {power_levels:#?}");
 
     let txn_id = Uuid::new_v4();
