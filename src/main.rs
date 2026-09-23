@@ -568,7 +568,7 @@ async fn move_aliases(
     .json::<Value>()
     .await?;
     if visibility["visibility"] == "public" {
-        for (room, visibility) in [(new_room_id, "public"), (room, "private")] {
+        let set_visibility = |room: &str, visibility: &str| {
             send(
                 http_client
                     .put(format!(
@@ -576,9 +576,15 @@ async fn move_aliases(
                     ))
                     .json(&json!({ "visibility": visibility })),
             )
-            .await?;
+        };
+        // Servers can restrict who may publish rooms, which won't change by retrying, so this
+        // doesn't fail the upgrade. The old room stays published to not drop out of the directory.
+        if let Err(err) = set_visibility(new_room_id, "public").await {
+            warn!("Failed to publish {new_room_id}, leaving {room} published instead: {err:#}");
+        } else {
+            set_visibility(room, "private").await?;
+            info!("Replaced {room} with {new_room_id} in the room directory");
         }
-        info!("Replaced {room} with {new_room_id} in the room directory");
     }
     Ok(())
 }
