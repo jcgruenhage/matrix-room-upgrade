@@ -277,6 +277,10 @@ async fn upgrade_room(
         )
         .await?;
         info!("Tombstoned {room}");
+        // The tombstone records the new room from here on.
+        if state.replacement_rooms.remove(room).is_some() {
+            state.save()?;
+        }
         new_room_id
     };
     restrict_old_room(http_client, &config.homeserver_url, room).await?;
