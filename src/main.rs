@@ -314,7 +314,8 @@ async fn create_replacement_room(
                     &["rooms", room, "send", "m.room.message", &txn_id.to_string()],
                 )?)
                 .json(&json!({
-                    "body": "Upgrading room, please stand by",
+                    "body": "This room is being upgraded, please stand by. \
+                    Invites to the new room will be sent out over the next few minutes.",
                     "msgtype": "m.text"
                 }
                 )),
@@ -1027,6 +1028,8 @@ async fn upgrade_room(
         .collect();
     debug!("Members in the new room: {new_members:?}");
 
+    info!("Banning up to {} members...", banned_members.len());
+
     for (user_id, reason) in banned_members.iter() {
         if new_members.contains(user_id.as_str()) {
             continue;
@@ -1052,6 +1055,11 @@ async fn upgrade_room(
         }
     }
 
+    let total_invite_count = joined_members.len();
+
+    info!("Inviting up to {} members...", total_invite_count);
+
+    let mut invite_counter: u32 = 0;
     for (user_id, reason) in joined_members.iter() {
         if config.drop_members.contains(user_id)
             || self_user_id == user_id
@@ -1059,6 +1067,12 @@ async fn upgrade_room(
         {
             continue;
         }
+        // this also logs on invite_counter = 0, but it serves as a reassuring starting point
+        // to let the user know the operation started
+        if invite_counter % 50 == 0 {
+            info!("status: sent {} invites / {}...", invite_counter, total_invite_count);
+        }
+        invite_counter += 1;
         if let Err(err) = send(
             http_client
                 .post(url(
